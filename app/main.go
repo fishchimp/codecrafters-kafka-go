@@ -52,11 +52,10 @@ func main() {
 		// Parse message_size
 		requestMessageSize := binary.BigEndian.Uint32(header[0:4])
 
-		// Allocate or reuse a buffer of length message_size
-		payload := make([]byte, requestMessageSize)
-		copy(payload[0:12], header) // already read first 12 bytes
+		// Read and discard the rest of the payload if present
 		if requestMessageSize > 12 {
-			if _, err = io.ReadFull(conn, payload[12:]); err != nil {
+			discardBuf := make([]byte, requestMessageSize-12)
+			if _, err = io.ReadFull(conn, discardBuf); err != nil {
 				if err == io.EOF {
 					break
 				}
