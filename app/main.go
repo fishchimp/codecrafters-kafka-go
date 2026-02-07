@@ -75,7 +75,7 @@ func main() {
 	bodyLength := len(responseBody)
 	messageSize := uint32(4 + bodyLength) // 4 bytes for correlation_id + body
 
-	header := make([]byte, 8)
+	
 	binary.BigEndian.PutUint32(header[0:4], messageSize)
 	binary.BigEndian.PutUint32(header[4:8], correlationID)
 
