@@ -32,12 +32,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse request_api_version (2 bytes at offset 6-7)
+	requestAPIVersion := binary.BigEndian.Uint16(header[6:8])
+	fmt.Printf("Parsed request_api_version: %d\n", requestAPIVersion)
+
+	// Compute error_code: 35 if not in 0-4, else 0
+	var errorCode uint16
+	if requestAPIVersion > 4 {
+		errorCode = 35
+	} else {
+		errorCode = 0
+	}
+
 	correlationID := binary.BigEndian.Uint32(header[8:12])
 
-	// Send response: 8 bytes total (message_size + correlation_id)
-	response := make([]byte, 8)
-	binary.BigEndian.PutUint32(response[0:4], 0) // message_size: 0
+	// Send response: 10 bytes total (message_size + correlation_id + error_code)
+	response := make([]byte, 10)
+	binary.BigEndian.PutUint32(response[0:4], 2) // message_size: can be any 4-byte value
 	binary.BigEndian.PutUint32(response[4:8], correlationID)
+	binary.BigEndian.PutUint16(response[8:10], errorCode)
 
 	_, err = conn.Write(response)
 	if err != nil {
