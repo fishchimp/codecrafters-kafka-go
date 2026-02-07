@@ -67,11 +67,46 @@ func handleConn(conn net.Conn) {
 		// Parse correlation_id (4 bytes at offset 4-7)
 		correlationID := binary.BigEndian.Uint32(payload[4:8])
 
+		// Compute start of request body (after header v2)
+		bodyIdx := 8
+		if len(payload) < bodyIdx+2 {
+			fmt.Println("Payload too short for client_id length")
+			break
+		}
+		clientIDLen := int16(binary.BigEndian.Uint16(payload[bodyIdx : bodyIdx+2]))
+		bodyIdx += 2
+		if clientIDLen >= 0 {
+			if len(payload) < bodyIdx+int(clientIDLen) {
+				fmt.Println("Payload too short for client_id")
+				break
+			}
+			bodyIdx += int(clientIDLen)
+		}
+		// Skip request header TAG_BUFFER (uvarint length + bytes)
+		tagLen := 0
+		for i := 0; i < 5; i++ { // uvarint max 5 bytes for 32-bit
+			if len(payload) <= bodyIdx {
+				fmt.Println("Payload too short for header TAG_BUFFER")
+				break
+			}
+			b := payload[bodyIdx]
+			bodyIdx++
+			tagLen |= int(b&0x7F) << (7 * i)
+			if b&0x80 == 0 {
+				break
+			}
+		}
+		if len(payload) < bodyIdx+tagLen {
+			fmt.Println("Payload too short for header TAG_BUFFER data")
+			break
+		}
+		bodyIdx += tagLen
+
 		// Parse topic name if DescribeTopicPartitions (API key 75)
 		var topicName string
 		if requestAPIKey == 75 {
-			// topics array starts at offset 8
-			idx := 8
+			// topics array starts at bodyIdx
+			idx := bodyIdx
 			if len(payload) <= idx {
 				fmt.Println("Payload too short for topics array")
 				break
