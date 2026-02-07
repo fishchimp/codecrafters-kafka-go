@@ -17,18 +17,23 @@ func main() {
 		fmt.Println("Failed to bind to port 9092")
 		os.Exit(1)
 	}
-	
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
-	}
-	defer conn.Close()
 
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection: ", err.Error())
+			continue
+		}
+		go handleConn(conn)
+	}
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
 	for {
 		// Read message_size (4 bytes) first
 		sizeBuf := make([]byte, 4)
-		if _, err = io.ReadFull(conn, sizeBuf); err != nil {
+		if _, err := io.ReadFull(conn, sizeBuf); err != nil {
 			if err == io.EOF {
 				break
 			}
@@ -44,7 +49,7 @@ func main() {
 		}
 
 		payload := make([]byte, requestMessageSize)
-		if _, err = io.ReadFull(conn, payload); err != nil {
+		if _, err := io.ReadFull(conn, payload); err != nil {
 			if err == io.EOF {
 				break
 			}
@@ -88,11 +93,11 @@ func main() {
 		binary.BigEndian.PutUint32(header[4:8], correlationID) // correlation_id
 
 		// Write header then body
-		if _, err = conn.Write(header); err != nil {
+		if _, err := conn.Write(header); err != nil {
 			fmt.Println("Error writing response header: ", err.Error())
 			break
 		}
-		if _, err = conn.Write(responseBody); err != nil {
+		if _, err := conn.Write(responseBody); err != nil {
 			fmt.Println("Error writing response body: ", err.Error())
 			break
 		}
