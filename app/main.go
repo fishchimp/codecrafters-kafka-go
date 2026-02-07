@@ -89,12 +89,12 @@ func main() {
 
 	// Prepend message_size (4 bytes) and correlation_id (4 bytes)
 	// Build response header
-	responseHeader = make([]byte, 8)
-	binary.BigEndian.PutUint32(responseHeader[0:4], messageSize) // message_size
-	binary.BigEndian.PutUint32(responseHeader[4:8], correlationID) // correlation_id
+	header = make([]byte, 8)
+	binary.BigEndian.PutUint32(header[0:4], messageSize) // message_size
+	binary.BigEndian.PutUint32(header[4:8], correlationID) // correlation_id
 
 	// Write header then body
-	if _, err = conn.Write(responseHeader); err != nil {
+	if _, err = conn.Write(header); err != nil {
 		fmt.Println("Error writing response header: ", err.Error())
 		os.Exit(1)
 	}
