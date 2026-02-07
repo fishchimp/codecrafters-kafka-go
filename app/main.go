@@ -75,17 +75,23 @@ func handleConn(conn net.Conn) {
 		// Build ApiVersions v4 response body:
 		responseBody := []byte{
 			byte(errorCode >> 8), byte(errorCode), // error_code (2)
-			0x02, // api_keys compact array length (1 element, zigzag encoded)
+			0x03, // api_keys compact array length (2 elements, zigzag encoded)
 			0x00, 0x12, // api_key 18
 			0x00, 0x00, // min_version 0
 			0x00, 0x04, // max_version 4
+			0x00, // element tag buffer
+			0x00, 0x4B, // api_key 75
+			0x00, 0x00, // min_version 0
+			0x00, 0x00, // max_version 0
 			0x00, // element tag buffer
 			0x00, 0x00, 0x00, 0x00, // throttle_time_ms
 			0x00, // response tag buffer
 		}
 
-		// Calculate message_size: everything after the message_size field
-		messageSize := uint32(19) // Total bytes after message_size field
+		// Update message_size to reflect new responseBody length
+		// Body: error_code (2) + api_keys (1+14) + throttle_time (4) + tag_buffer (1) = 22
+		// message_size = 4 (correlation_id) + 22 = 26
+		messageSize := uint32(26) // 0x0000001A
 
 		// Prepend message_size (4 bytes) and correlation_id (4 bytes)
 		header := make([]byte, 8)
