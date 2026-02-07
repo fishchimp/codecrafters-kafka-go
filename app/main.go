@@ -220,16 +220,15 @@ func handleConn(conn net.Conn) {
 				0x00, 0x00, 0x00, 0x00, // throttle_time_ms
 				0x00, // response tag buffer
 			}
-			messageSize := uint32(5 + len(responseBody)) // 5 bytes for header v1 (correlation_id + tag buffer)
+			messageSize := uint32(4 + len(responseBody)) // header v0 (correlation_id only) + body
 			sizeOut := make([]byte, 4)
 			binary.BigEndian.PutUint32(sizeOut, messageSize)
 			if _, err := conn.Write(sizeOut); err != nil {
 				fmt.Println("Error writing message size: ", err.Error())
 				break
 			}
-			header := make([]byte, 5)
+			header := make([]byte, 4)
 			binary.BigEndian.PutUint32(header[0:4], correlationID)
-			header[4] = 0x00 // TAG_BUFFER is empty
 			if _, err := conn.Write(header); err != nil {
 				fmt.Println("Error writing response header: ", err.Error())
 				break
