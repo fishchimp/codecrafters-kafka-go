@@ -112,48 +112,56 @@ func handleConn(conn net.Conn) {
 			fmt.Printf("Parsed topic name: %s\n", topicName)
 		}
 
-			   if requestAPIKey == 75 {
-				   // Build DescribeTopicPartitions v0 response body as specified
-				   // throttle_time_ms (4 bytes)
-				   responseBody := make([]byte, 0)
-				   responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00) // throttle_time_ms = 0
-				   // topics COMPACT_ARRAY with 1 element (length byte 0x02)
-				   responseBody = append(responseBody, 0x02)
-				   // Topic element:
-				   // error_code = 3 (2 bytes)
-				   responseBody = append(responseBody, 0x00, 0x03)
-				   // topic_name as COMPACT_STRING
-				   topicNameLen := len(topicName)
-				   responseBody = append(responseBody, byte(topicNameLen+1))
-				   responseBody = append(responseBody, []byte(topicName)...)
-				   // topic_id = 16 zero bytes
-				   responseBody = append(responseBody, make([]byte, 16)...)
-				   // is_internal = 0
-				   responseBody = append(responseBody, 0x00)
-				   // partitions COMPACT_ARRAY empty (length byte 0x01)
-				   responseBody = append(responseBody, 0x01)
-				   // topic_authorized_operations = 0 (4 bytes)
-				   responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00)
-				   // topic TAG_BUFFER = 0x00
-				   responseBody = append(responseBody, 0x00)
-				   // next_cursor = NULLABLE_INT8 = -1 (0xFF)
-				   responseBody = append(responseBody, 0xFF)
-				   // response TAG_BUFFER = 0x00
-				   responseBody = append(responseBody, 0x00)
+		if requestAPIKey == 75 {
+			// Build DescribeTopicPartitions v0 response body as specified
+			// throttle_time_ms (4 bytes)
+			responseBody := make([]byte, 0)
+			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00) // throttle_time_ms = 0
+			// topics COMPACT_ARRAY with 1 element (length byte 0x02)
+			responseBody = append(responseBody, 0x02)
+			// Topic element:
+			// error_code = 3 (2 bytes)
+			responseBody = append(responseBody, 0x00, 0x03)
+			// topic_name as COMPACT_STRING
+			topicNameLen := len(topicName)
+			responseBody = append(responseBody, byte(topicNameLen+1))
+			responseBody = append(responseBody, []byte(topicName)...)
+			// topic_id = 16 zero bytes
+			responseBody = append(responseBody, make([]byte, 16)...)
+			// is_internal = 0
+			responseBody = append(responseBody, 0x00)
+			// partitions COMPACT_ARRAY empty (length byte 0x01)
+			responseBody = append(responseBody, 0x01)
+			// topic_authorized_operations = 0 (4 bytes)
+			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00)
+			// topic TAG_BUFFER = 0x00
+			responseBody = append(responseBody, 0x00)
+			// next_cursor = NULLABLE_INT8 = -1 (0xFF)
+			responseBody = append(responseBody, 0xFF)
+			// response TAG_BUFFER = 0x00
+			responseBody = append(responseBody, 0x00)
 
-				   // Header v1: correlation_id (4 bytes) + TAG_BUFFER (1 byte)
-				   header := make([]byte, 5)
-				   binary.BigEndian.PutUint32(header[0:4], correlationID)
-				   header[4] = 0x00 // TAG_BUFFER is empty
-				   if _, err := conn.Write(header); err != nil {
-					   fmt.Println("Error writing response header: ", err.Error())
-					   break
-				   }
-				   if _, err := conn.Write(responseBody); err != nil {
-					   fmt.Println("Error writing response body: ", err.Error())
-					   break
-				   }
-			   } else {
+			messageSize := uint32(5 + len(responseBody)) // header v1 (5) + body
+			sizeOut := make([]byte, 4)
+			binary.BigEndian.PutUint32(sizeOut, messageSize)
+			if _, err := conn.Write(sizeOut); err != nil {
+				fmt.Println("Error writing message size: ", err.Error())
+				break
+			}
+
+			// Header v1: correlation_id (4 bytes) + TAG_BUFFER (1 byte)
+			header := make([]byte, 5)
+			binary.BigEndian.PutUint32(header[0:4], correlationID)
+			header[4] = 0x00 // TAG_BUFFER is empty
+			if _, err := conn.Write(header); err != nil {
+				fmt.Println("Error writing response header: ", err.Error())
+				break
+			}
+			if _, err := conn.Write(responseBody); err != nil {
+				fmt.Println("Error writing response body: ", err.Error())
+				break
+			}
+		} else {
 			// ApiVersions (or other) response
 			// Compute error_code: 35 if not in 0-4, else 0
 			var errorCode uint16
@@ -178,6 +186,12 @@ func handleConn(conn net.Conn) {
 				0x00, // response tag buffer
 			}
 			messageSize := uint32(5 + len(responseBody)) // 5 bytes for header v1 (correlation_id + tag buffer)
+			sizeOut := make([]byte, 4)
+			binary.BigEndian.PutUint32(sizeOut, messageSize)
+			if _, err := conn.Write(sizeOut); err != nil {
+				fmt.Println("Error writing message size: ", err.Error())
+				break
+			}
 			header := make([]byte, 5)
 			binary.BigEndian.PutUint32(header[0:4], correlationID)
 			header[4] = 0x00 // TAG_BUFFER is empty
