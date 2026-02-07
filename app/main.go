@@ -98,18 +98,6 @@ func main() {
 			0x00, // response tag buffer
 		}
 
-		// Build response header (8 bytes)
-		header = make([]byte, 8)
-		binary.BigEndian.PutUint32(header[0:4], uint32(len(header)+len(responseBody))) // message_size
-		binary.BigEndian.PutUint32(header[4:8], correlationID)
-
-		// Write header + body in a single call to ensure exactly the expected bytes are sent
-		response := append(header, responseBody...)
-		if _, err = conn.Write(response); err != nil {
-			fmt.Println("Error writing response: ", err.Error())
-			break
-		}
-
 		// Calculate message_size: everything after the message_size field
 		// This includes: correlation_id (4) + error_code (2) + array_length (1) +
 		// api_key (2) + min_version (2) + max_version (2) + element_tag (1) + throttle_time (4) + response_tag (1)
