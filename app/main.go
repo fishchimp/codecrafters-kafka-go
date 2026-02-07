@@ -46,15 +46,46 @@ func main() {
 
 	correlationID := binary.BigEndian.Uint32(header[8:12])
 
-	// Send response: 10 bytes total (message_size + correlation_id + error_code)
-	response := make([]byte, 10)
-	binary.BigEndian.PutUint32(response[0:4], 2) // message_size: can be any 4-byte value
-	binary.BigEndian.PutUint32(response[4:8], correlationID)
-	binary.BigEndian.PutUint16(response[8:10], errorCode)
+	// Build ApiVersions v4 response body:
+	// error_code (2 bytes)
+	// api_keys compact array length 0x02 (1 element)
+	// api_key 18, min 0, max 4, element tag buffer 0x00
+	// throttle_time_ms (4 bytes zero)
+	// response tag buffer 0x00
 
-	_, err = conn.Write(response)
-	if err != nil {
-		fmt.Println("Error writing response: ", err.Error())
+	responseBody := make([]byte, 0, 11)
+	// error_code
+	responseBody = append(responseBody, byte(errorCode>>8), byte(errorCode))
+	// api_keys compact array length (0x02 means 1 element, zigzag encoding for compact array length: n+1)
+	responseBody = append(responseBody, 0x02)
+	// api_key 18
+	responseBody = append(responseBody, 0x00, 0x12)
+	// min_version 0
+	responseBody = append(responseBody, 0x00, 0x00)
+	// max_version 4
+	responseBody = append(responseBody, 0x00, 0x04)
+	// element tag buffer
+	responseBody = append(responseBody, 0x00)
+	// throttle_time_ms (4 bytes zero)
+	responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00)
+	// response tag buffer
+	responseBody = append(responseBody, 0x00)
+
+	// Prepend message_size (4 bytes) and correlation_id (4 bytes), then write header + body
+	bodyLength := len(responseBody)
+	messageSize := uint32(4 + bodyLength) // 4 bytes for correlation_id + body
+
+	header := make([]byte, 8)
+	binary.BigEndian.PutUint32(header[0:4], messageSize)
+	binary.BigEndian.PutUint32(header[4:8], correlationID)
+
+	// Write header then body
+	if _, err = conn.Write(header); err != nil {
+		fmt.Println("Error writing response header: ", err.Error())
+		os.Exit(1)
+	}
+	if _, err = conn.Write(responseBody); err != nil {
+		fmt.Println("Error writing response body: ", err.Error())
 		os.Exit(1)
 	}
 }
