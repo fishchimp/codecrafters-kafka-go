@@ -100,7 +100,7 @@ func main() {
 
 		// Build response header (8 bytes)
 		header = make([]byte, 8)
-		binary.BigEndian.PutUint32(header[0:4], 19) // message_size
+		binary.BigEndian.PutUint32(header[0:4], header + messageSize) // message_size
 		binary.BigEndian.PutUint32(header[4:8], correlationID)
 
 		// Write header + body in a single call to ensure exactly the expected bytes are sent
