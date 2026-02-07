@@ -36,36 +36,24 @@ func main() {
 			break
 		}
 
-		// Read the next 8 bytes to get the rest of the header (api_key + api_version + correlation_id)
-		headerRest := make([]byte, 8)
-		if _, err = io.ReadFull(conn, headerRest); err != nil {
-			if err == io.EOF {
-				break
-			}
-			fmt.Println("Error reading request header: ", err.Error())
+		requestMessageSize := binary.BigEndian.Uint32(sizeBuf)
+
+		if requestMessageSize < 8 {
+			fmt.Println("Invalid message_size (too small): ", requestMessageSize)
 			break
 		}
 
-		// Combine sizeBuf and headerRest for compatibility with existing code
-		header := append(sizeBuf, headerRest...)
-
-		// Parse message_size
-		requestMessageSize := binary.BigEndian.Uint32(header[0:4])
-
-		// Read and discard the rest of the payload if present
-		if requestMessageSize > 12 {
-			discardBuf := make([]byte, requestMessageSize-12)
-			if _, err = io.ReadFull(conn, discardBuf); err != nil {
-				if err == io.EOF {
-					break
-				}
-				fmt.Println("Error reading request payload: ", err.Error())
+		payload := make([]byte, requestMessageSize)
+		if _, err = io.ReadFull(conn, payload); err != nil {
+			if err == io.EOF {
 				break
 			}
+			fmt.Println("Error reading request payload: ", err.Error())
+			break
 		}
 
-		// Parse request_api_version (2 bytes at offset 6-7)
-		requestAPIVersion := binary.BigEndian.Uint16(header[6:8])
+		// Parse api_version (2 bytes at offset 2-3)
+		requestAPIVersion := binary.BigEndian.Uint16(payload[2:4])
 		fmt.Printf("Parsed request_api_version: %d\n", requestAPIVersion)
 
 		// Compute error_code: 35 if not in 0-4, else 0
@@ -76,16 +64,10 @@ func main() {
 			errorCode = 0
 		}
 
-		correlationID := binary.BigEndian.Uint32(header[8:12])
+		// Parse correlation_id (4 bytes at offset 4-7)
+		correlationID := binary.BigEndian.Uint32(payload[4:8])
 
 		// Build ApiVersions v4 response body:
-		// error_code (2 bytes)
-		// api_keys compact array length 0x02 (1 element)
-		// api_key 18, min 0, max 4, element tag buffer 0x00
-		// throttle_time_ms (4 bytes zero)
-		// response tag buffer 0x00
-
-		// Build response body (exact bytes, 19 bytes)
 		responseBody := []byte{
 			byte(errorCode >> 8), byte(errorCode), // error_code (2)
 			0x02, // api_keys compact array length (1 element, zigzag encoded)
@@ -98,13 +80,10 @@ func main() {
 		}
 
 		// Calculate message_size: everything after the message_size field
-		// This includes: correlation_id (4) + error_code (2) + array_length (1) +
-		// api_key (2) + min_version (2) + max_version (2) + element_tag (1) + throttle_time (4) + response_tag (1)
 		messageSize := uint32(19) // Total bytes after message_size field
 
 		// Prepend message_size (4 bytes) and correlation_id (4 bytes)
-		// Build response header
-		header = make([]byte, 8)
+		header := make([]byte, 8)
 		binary.BigEndian.PutUint32(header[0:4], messageSize) // message_size
 		binary.BigEndian.PutUint32(header[4:8], correlationID) // correlation_id
 
