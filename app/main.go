@@ -170,6 +170,27 @@ func readVarintZigZag(data []byte, idx *int) (int, error) {
 	return int(v), nil
 }
 
+func readUvarint(data []byte, idx *int) (uint64, error) {
+	var u uint64
+	var shift uint
+	for {
+		if *idx >= len(data) {
+			return 0, io.ErrUnexpectedEOF
+		}
+		b := data[*idx]
+		*idx++
+		u |= uint64(b&0x7F) << shift
+		if b&0x80 == 0 {
+			break
+		}
+		shift += 7
+		if shift > 63 {
+			return 0, io.ErrUnexpectedEOF
+		}
+	}
+	return u, nil
+}
+
 func readInt16(data []byte, idx *int) (int16, bool) {
 	if *idx+2 > len(data) {
 		return 0, false
@@ -214,6 +235,81 @@ func readInt32Array(data []byte, idx *int) ([]int32, bool) {
 	return arr, true
 }
 
+func readCompactString(data []byte, idx *int) (string, bool) {
+	nPlus, err := readUvarint(data, idx)
+	if err != nil {
+		return "", false
+	}
+	if nPlus == 0 {
+		return "", false
+	}
+	n := int(nPlus - 1)
+	if *idx+n > len(data) {
+		return "", false
+	}
+	s := string(data[*idx : *idx+n])
+	*idx += n
+	return s, true
+}
+
+func readCompactInt32Array(data []byte, idx *int) ([]int32, bool) {
+	nPlus, err := readUvarint(data, idx)
+	if err != nil {
+		return nil, false
+	}
+	if nPlus == 0 {
+		return nil, false
+	}
+	n := int32(nPlus - 1)
+	arr := make([]int32, n)
+	for i := int32(0); i < n; i++ {
+		v, ok := readInt32(data, idx)
+		if !ok {
+			return nil, false
+		}
+		arr[i] = v
+	}
+	return arr, true
+}
+
+func readCompactUUIDArray(data []byte, idx *int) (int, bool) {
+	nPlus, err := readUvarint(data, idx)
+	if err != nil {
+		return 0, false
+	}
+	if nPlus == 0 {
+		return 0, false
+	}
+	n := int(nPlus - 1)
+	for i := 0; i < n; i++ {
+		if _, ok := readUUID(data, idx); !ok {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+func skipTaggedFields(data []byte, idx *int) bool {
+	numTags, err := readUvarint(data, idx)
+	if err != nil {
+		return false
+	}
+	for i := uint64(0); i < numTags; i++ {
+		if _, err := readUvarint(data, idx); err != nil { // tag id
+			return false
+		}
+		size, err := readUvarint(data, idx)
+		if err != nil {
+			return false
+		}
+		if *idx+int(size) > len(data) {
+			return false
+		}
+		*idx += int(size)
+	}
+	return true
+}
+
 func parseMetadataRecord(val []byte, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) {
 	if len(val) < 2 {
 		return
@@ -234,24 +330,38 @@ func parseMetadataRecord(val []byte, topicByID map[[16]byte]string, topicByUUID 
 			idx = 4
 		}
 	}
-	if rtype == -1 || version != 0 {
+	if rtype == -1 || (version != 0 && version != 1) {
 		return
 	}
 
 	switch rtype {
 	case 2: // TopicRecord v0
-		nameLen, ok := readInt16(val, &idx)
-		if !ok || nameLen < 0 {
-			return
+		var name string
+		var ok bool
+		if version == 0 {
+			nameLen, ok := readInt16(val, &idx)
+			if !ok || nameLen < 0 {
+				return
+			}
+			if idx+int(nameLen) > len(val) {
+				return
+			}
+			name = string(val[idx : idx+int(nameLen)])
+			idx += int(nameLen)
+		} else {
+			name, ok = readCompactString(val, &idx)
+			if !ok {
+				return
+			}
 		}
-		if idx+int(nameLen) > len(val) {
-			return
-		}
-		name := string(val[idx : idx+int(nameLen)])
-		idx += int(nameLen)
 		uuid, ok := readUUID(val, &idx)
 		if !ok {
 			return
+		}
+		if version == 1 {
+			if !skipTaggedFields(val, &idx) {
+				return
+			}
 		}
 		meta, ok := topicByUUID[uuid]
 		if !ok {
@@ -270,19 +380,38 @@ func parseMetadataRecord(val []byte, topicByID map[[16]byte]string, topicByUUID 
 		if !ok {
 			return
 		}
-		replicas, ok := readInt32Array(val, &idx)
-		if !ok {
-			return
-		}
-		isr, ok := readInt32Array(val, &idx)
-		if !ok {
-			return
-		}
-		if _, ok := readInt32Array(val, &idx); !ok { // removingReplicas
-			return
-		}
-		if _, ok := readInt32Array(val, &idx); !ok { // addingReplicas
-			return
+		var replicas []int32
+		var isr []int32
+		if version == 0 {
+			replicas, ok = readInt32Array(val, &idx)
+			if !ok {
+				return
+			}
+			isr, ok = readInt32Array(val, &idx)
+			if !ok {
+				return
+			}
+			if _, ok := readInt32Array(val, &idx); !ok { // removingReplicas
+				return
+			}
+			if _, ok := readInt32Array(val, &idx); !ok { // addingReplicas
+				return
+			}
+		} else {
+			replicas, ok = readCompactInt32Array(val, &idx)
+			if !ok {
+				return
+			}
+			isr, ok = readCompactInt32Array(val, &idx)
+			if !ok {
+				return
+			}
+			if _, ok := readCompactInt32Array(val, &idx); !ok { // removingReplicas
+				return
+			}
+			if _, ok := readCompactInt32Array(val, &idx); !ok { // addingReplicas
+				return
+			}
 		}
 		leader, ok := readInt32(val, &idx)
 		if !ok {
@@ -295,12 +424,21 @@ func parseMetadataRecord(val []byte, topicByID map[[16]byte]string, topicByUUID 
 		if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
 			return
 		}
-		dirCount, ok := readInt32(val, &idx)
-		if !ok || dirCount < 0 {
-			return
-		}
-		for i := int32(0); i < dirCount; i++ {
-			if _, ok := readUUID(val, &idx); !ok {
+		if version == 0 {
+			dirCount, ok := readInt32(val, &idx)
+			if !ok || dirCount < 0 {
+				return
+			}
+			for i := int32(0); i < dirCount; i++ {
+				if _, ok := readUUID(val, &idx); !ok {
+					return
+				}
+			}
+		} else {
+			if _, ok := readCompactUUIDArray(val, &idx); !ok {
+				return
+			}
+			if !skipTaggedFields(val, &idx) {
 				return
 			}
 		}
