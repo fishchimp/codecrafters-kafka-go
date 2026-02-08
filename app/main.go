@@ -265,23 +265,31 @@ func handleConn(conn net.Conn) {
 			var errorCode uint16 = 3 // unknown topic
 			var topicID [16]byte
 			var partitionsArray []byte
-			if topicFound && topicMeta != nil {
+			if topicFound && topicMeta != nil && len(topicMeta.Partitions) > 0 {
 				errorCode = 0
 				topicID = topicMeta.UUID
-				// Build partitions COMPACT_ARRAY with 1 partition
 				partitionsArray = make([]byte, 0)
-				partitionsArray = append(partitionsArray, 0x02) // length byte (1 element)
-				// Partition element:
-				partitionsArray = append(partitionsArray, 0x00, 0x00) // error_code = 0
-				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // partition_index = 0
-				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // leader_id = 0
-				partitionsArray = append(partitionsArray, 0x01) // replicas COMPACT_ARRAY (1 element)
-				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // replica = 0
-				partitionsArray = append(partitionsArray, 0x00) // element tag buffer
-				partitionsArray = append(partitionsArray, 0x01) // isr COMPACT_ARRAY (1 element)
-				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // isr = 0
-				partitionsArray = append(partitionsArray, 0x00) // element tag buffer
-				partitionsArray = append(partitionsArray, 0x00) // partition tag buffer
+				partitionsArray = append(partitionsArray, byte(len(topicMeta.Partitions)+1)) // compact array length
+				for _, partitionIdx := range topicMeta.Partitions {
+					// Partition element:
+					partitionsArray = append(partitionsArray, 0x00, 0x00) // error_code = 0
+					partitionsArray = append(partitionsArray,
+						byte(partitionIdx>>24), byte(partitionIdx>>16), byte(partitionIdx>>8), byte(partitionIdx)) // partition_index
+					leaderID := int32(1)
+					partitionsArray = append(partitionsArray,
+						byte(leaderID>>24), byte(leaderID>>16), byte(leaderID>>8), byte(leaderID)) // leader_id = 1
+					// replica_nodes COMPACT_ARRAY (1 element: leaderID)
+					partitionsArray = append(partitionsArray, 0x02) // length byte (1 element)
+					partitionsArray = append(partitionsArray,
+						byte(leaderID>>24), byte(leaderID>>16), byte(leaderID>>8), byte(leaderID)) // replica = 1
+					partitionsArray = append(partitionsArray, 0x00) // element tag buffer
+					// isr_nodes COMPACT_ARRAY (1 element: leaderID)
+					partitionsArray = append(partitionsArray, 0x02) // length byte (1 element)
+					partitionsArray = append(partitionsArray,
+						byte(leaderID>>24), byte(leaderID>>16), byte(leaderID>>8), byte(leaderID)) // isr = 1
+					partitionsArray = append(partitionsArray, 0x00) // element tag buffer
+					partitionsArray = append(partitionsArray, 0x00) // partition tag buffer
+				}
 			} else {
 				// topic unknown, partitions empty
 				partitionsArray = []byte{0x01} // empty partitions array
