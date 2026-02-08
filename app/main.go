@@ -6,11 +6,114 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 )
 
+// TopicMetadata holds topic uuid and partition ids
+// uuid is 16 bytes (as []byte), partitions is a slice of int32
+//
+type TopicMetadata struct {
+	UUID       [16]byte
+	Partitions []int32
+}
+
+// Global in-memory map: topic_name -> TopicMetadata
+var topicMap = make(map[string]*TopicMetadata)
+
+// Reads cluster metadata log and populates topicMap
+func loadClusterMetadataLog(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for {
+		head := make([]byte, 12) // offset(8) + size(4)
+		_, err := io.ReadFull(f, head)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		recordSize := binary.BigEndian.Uint32(head[8:12])
+		record := make([]byte, recordSize)
+		_, err = io.ReadFull(f, record)
+		if err != nil {
+			return err
+		}
+		// Kafka log record: magic(1), attributes(1), timestampDelta(4), offsetDelta(4), keyLen(4), key, valueLen(4), value
+		if len(record) < 18 {
+			continue
+		}
+		keyLen := int(binary.BigEndian.Uint32(record[10:14]))
+		if len(record) < 14+keyLen+4 {
+			continue
+		}
+		key := record[14 : 14+keyLen]
+		valLen := int(binary.BigEndian.Uint32(record[14+keyLen : 14+keyLen+4]))
+		if len(record) < 14+keyLen+4+valLen {
+			continue
+		}
+		val := record[14+keyLen+4 : 14+keyLen+4+valLen]
+		// Topic record: key starts with "__topic__"
+		if strings.HasPrefix(string(key), "__topic__") && len(val) >= 16 {
+			// topic name after prefix
+			name := string(key[len("__topic__") : ])
+			var uuid [16]byte
+			copy(uuid[:], val[:16])
+			if _, ok := topicMap[name]; !ok {
+				topicMap[name] = &TopicMetadata{UUID: uuid}
+			} else {
+				topicMap[name].UUID = uuid
+			}
+			continue
+		}
+		// Partition record: key starts with "__partition__" + topic + partition id
+		if strings.HasPrefix(string(key), "__partition__") {
+			rem := key[len("__partition__"):]
+			// Find last '-' (topic-partition)
+			sep := strings.LastIndexByte(string(rem), '-')
+			if sep < 0 {
+				continue
+			}
+			topic := string(rem[:sep])
+			partID := rem[sep+1:]
+			pid := int32(0)
+			for _, b := range partID {
+				if b < '0' || b > '9' {
+					pid = -1
+					break
+				}
+				pid = pid*10 + int32(b-'0')
+			}
+			if pid < 0 {
+				continue
+			}
+			meta, ok := topicMap[topic]
+			if !ok {
+				meta = &TopicMetadata{}
+				topicMap[topic] = meta
+			}
+			found := false
+			for _, p := range meta.Partitions {
+				if p == pid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				meta.Partitions = append(meta.Partitions, pid)
+			}
+		}
+	}
+	return nil
+}
+
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
+	_ = loadClusterMetadataLog("00000000000000000000.log") // ignore error for now
 
 	l, err := net.Listen("tcp", "0.0.0.0:9092")
 	if err != nil {
@@ -104,6 +207,8 @@ func handleConn(conn net.Conn) {
 
 		// Parse topic name if DescribeTopicPartitions (API key 75)
 		var topicName string
+		var topicMeta *TopicMetadata
+		var topicFound bool
 		if requestAPIKey == 75 {
 			// topics array starts at bodyIdx
 			idx := bodyIdx
@@ -145,38 +250,56 @@ func handleConn(conn net.Conn) {
 			}
 			idx++ // skip request TAG_BUFFER (should be 0x00)
 			fmt.Printf("Parsed topic name: %s\n", topicName)
+
+			// Lookup topic metadata
+			topicMeta, topicFound = topicMap[topicName]
 		}
 
 		if requestAPIKey == 75 {
-			// Build DescribeTopicPartitions v0 response body as specified
-			// throttle_time_ms (4 bytes)
+			// Build DescribeTopicPartitions v0 response body
 			responseBody := make([]byte, 0)
 			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00) // throttle_time_ms = 0
-			// topics COMPACT_ARRAY with 1 element (length byte 0x02)
-			responseBody = append(responseBody, 0x02)
+			responseBody = append(responseBody, 0x02) // topics COMPACT_ARRAY with 1 element
+
 			// Topic element:
-			// error_code = 3 (2 bytes)
-			responseBody = append(responseBody, 0x00, 0x03)
-			// topic_name as COMPACT_STRING
+			var errorCode uint16 = 3 // unknown topic
+			var topicID [16]byte
+			var partitionsArray []byte
+			if topicFound && topicMeta != nil {
+				errorCode = 0
+				topicID = topicMeta.UUID
+				// Build partitions COMPACT_ARRAY with 1 partition
+				partitionsArray = make([]byte, 0)
+				partitionsArray = append(partitionsArray, 0x02) // length byte (1 element)
+				// Partition element:
+				partitionsArray = append(partitionsArray, 0x00, 0x00) // error_code = 0
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // partition_index = 0
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // leader_id = 0
+				partitionsArray = append(partitionsArray, 0x01) // replicas COMPACT_ARRAY (1 element)
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // replica = 0
+				partitionsArray = append(partitionsArray, 0x00) // element tag buffer
+				partitionsArray = append(partitionsArray, 0x01) // isr COMPACT_ARRAY (1 element)
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // isr = 0
+				partitionsArray = append(partitionsArray, 0x00) // element tag buffer
+				partitionsArray = append(partitionsArray, 0x00) // partition tag buffer
+			} else {
+				// topic unknown, partitions empty
+				partitionsArray = []byte{0x01} // empty partitions array
+			}
+
+			responseBody = append(responseBody, byte(errorCode>>8), byte(errorCode)) // error_code
 			topicNameLen := len(topicName)
 			responseBody = append(responseBody, byte(topicNameLen+1))
 			responseBody = append(responseBody, []byte(topicName)...)
-			// topic_id = 16 zero bytes
-			responseBody = append(responseBody, make([]byte, 16)...)
-			// is_internal = 0
-			responseBody = append(responseBody, 0x00)
-			// partitions COMPACT_ARRAY empty (length byte 0x01)
-			responseBody = append(responseBody, 0x01)
-			// topic_authorized_operations = 0 (4 bytes)
-			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00)
-			// topic TAG_BUFFER = 0x00
-			responseBody = append(responseBody, 0x00)
-			// next_cursor = NULLABLE_INT8 = -1 (0xFF)
-			responseBody = append(responseBody, 0xFF)
-			// response TAG_BUFFER = 0x00
-			responseBody = append(responseBody, 0x00)
+			responseBody = append(responseBody, topicID[:]...) // topic_id
+			responseBody = append(responseBody, 0x00) // is_internal = 0
+			responseBody = append(responseBody, partitionsArray...)
+			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00) // topic_authorized_operations
+			responseBody = append(responseBody, 0x00) // topic TAG_BUFFER
+			responseBody = append(responseBody, 0xFF) // next_cursor = NULLABLE_INT8 = -1
+			responseBody = append(responseBody, 0x00) // response TAG_BUFFER
 
-			messageSize := uint32(5 + len(responseBody)) // header v1 (5) + body
+			messageSize := uint32(len(header) + len(responseBody)) // header v1 (5) + body
 			sizeOut := make([]byte, 4)
 			binary.BigEndian.PutUint32(sizeOut, messageSize)
 			if _, err := conn.Write(sizeOut); err != nil {
