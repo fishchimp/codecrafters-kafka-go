@@ -6,138 +6,114 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 )
 
-// TopicMetadata holds topic uuid and partitions.
+// TopicMetadata holds topic uuid and partition ids
+// uuid is 16 bytes (as []byte), partitions is a slice of int32
+//
 type TopicMetadata struct {
 	UUID       [16]byte
-	Partitions []PartitionMetadata
+	Partitions []int32
 }
 
-type PartitionMetadata struct {
-	ID       int32
-	Leader   int32
-	Replicas []int32
-	ISR      []int32
-}
-
-// Global in-memory map: topic_name -> TopicMetadata.
+// Global in-memory map: topic_name -> TopicMetadata
 var topicMap = make(map[string]*TopicMetadata)
 
-// Reads cluster metadata log and populates topicMap.
+// Reads cluster metadata log and populates topicMap
 func loadClusterMetadataLog(path string) error {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	// Map from topic UUID -> name (filled by TopicRecord).
-	topicByID := make(map[[16]byte]string)
-	// Map from topic UUID -> metadata (for early PartitionRecords).
-	topicByUUID := make(map[[16]byte]*TopicMetadata)
-
-	for off := 0; off+12 <= len(data); {
-		baseOffset := binary.BigEndian.Uint64(data[off : off+8])
-		_ = baseOffset
-		batchLen := int(binary.BigEndian.Uint32(data[off+8 : off+12]))
-		if batchLen <= 0 || off+12+batchLen > len(data) {
+	for {
+		head := make([]byte, 12) // offset(8) + size(4)
+		_, err := io.ReadFull(f, head)
+		if err == io.EOF {
 			break
 		}
-		batchEnd := off + 12 + batchLen
-		off += 12
-
-		if off+49 > len(data) {
-			break
+		if err != nil {
+			return err
 		}
-		partitionLeaderEpoch := binary.BigEndian.Uint32(data[off : off+4])
-		_ = partitionLeaderEpoch
-		magic := data[off+4]
-		if magic != 2 {
-			off = batchEnd
+		recordSize := binary.BigEndian.Uint32(head[8:12])
+		record := make([]byte, recordSize)
+		_, err = io.ReadFull(f, record)
+		if err != nil {
+			return err
+		}
+		// Kafka log record: magic(1), attributes(1), timestampDelta(4), offsetDelta(4), keyLen(4), key, valueLen(4), value
+		if len(record) < 18 {
 			continue
 		}
-		// Skip to recordsCount.
-		recordsCount := binary.BigEndian.Uint32(data[off+45 : off+49])
-		off += 49
-
-		for i := uint32(0); i < recordsCount && off < batchEnd; i++ {
-			recordLen, err := readVarintZigZag(data, &off)
-			if err != nil || recordLen <= 0 {
-				break
-			}
-			recordEnd := off + recordLen
-			if recordEnd > batchEnd {
-				break
-			}
-			// attributes
-			off++
-			// timestampDelta, offsetDelta
-			if _, err := readVarintZigZag(data, &off); err != nil {
-				break
-			}
-			if _, err := readVarintZigZag(data, &off); err != nil {
-				break
-			}
-			// key
-			keyLen, err := readVarintZigZag(data, &off)
-			if err != nil {
-				break
-			}
-			if keyLen >= 0 {
-				if off+keyLen > recordEnd {
-					break
-				}
-				off += keyLen
-			}
-			// value
-			valLen, err := readVarintZigZag(data, &off)
-			if err != nil {
-				break
-			}
-			var val []byte
-			if valLen >= 0 {
-				if off+valLen > recordEnd {
-					break
-				}
-				val = data[off : off+valLen]
-				off += valLen
-			}
-			// headers
-			hCount, err := readVarintZigZag(data, &off)
-			if err != nil {
-				break
-			}
-			for h := 0; h < hCount; h++ {
-				hKeyLen, err := readVarintZigZag(data, &off)
-				if err != nil {
-					break
-				}
-				if hKeyLen > 0 {
-					off += hKeyLen
-				}
-				hValLen, err := readVarintZigZag(data, &off)
-				if err != nil {
-					break
-				}
-				if hValLen > 0 {
-					off += hValLen
-				}
-			}
-
-			if len(val) > 0 {
-				parseMetadataRecord(val, topicByID, topicByUUID)
-			}
-
-			off = recordEnd
+		keyLen := int(binary.BigEndian.Uint32(record[10:14]))
+		if len(record) < 14+keyLen+4 {
+			continue
 		}
-		off = batchEnd
+		key := record[14 : 14+keyLen]
+		valLen := int(binary.BigEndian.Uint32(record[14+keyLen : 14+keyLen+4]))
+		if len(record) < 14+keyLen+4+valLen {
+			continue
+		}
+		val := record[14+keyLen+4 : 14+keyLen+4+valLen]
+		// Topic record: key starts with "__topic__"
+		if strings.HasPrefix(string(key), "__topic__") && len(val) >= 16 {
+			// topic name after prefix
+			name := string(key[len("__topic__") : ])
+			var uuid [16]byte
+			copy(uuid[:], val[:16])
+			if _, ok := topicMap[name]; !ok {
+				topicMap[name] = &TopicMetadata{UUID: uuid}
+			} else {
+				topicMap[name].UUID = uuid
+			}
+			continue
+		}
+		// Partition record: key starts with "__partition__" + topic + partition id
+		if strings.HasPrefix(string(key), "__partition__") {
+			rem := key[len("__partition__"):]
+			// Find last '-' (topic-partition)
+			sep := strings.LastIndexByte(string(rem), '-')
+			if sep < 0 {
+				continue
+			}
+			topic := string(rem[:sep])
+			partID := rem[sep+1:]
+			pid := int32(0)
+			for _, b := range partID {
+				if b < '0' || b > '9' {
+					pid = -1
+					break
+				}
+				pid = pid*10 + int32(b-'0')
+			}
+			if pid < 0 {
+				continue
+			}
+			meta, ok := topicMap[topic]
+			if !ok {
+				meta = &TopicMetadata{}
+				topicMap[topic] = meta
+			}
+			found := false
+			for _, p := range meta.Partitions {
+				if p == pid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				meta.Partitions = append(meta.Partitions, pid)
+			}
+		}
 	}
 	return nil
 }
 
 func main() {
 	fmt.Println("Logs from your program will appear here!")
-	_ = loadClusterMetadataLog("/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log")
+	_ = loadClusterMetadataLog("00000000000000000000.log") // ignore error for now
 
 	l, err := net.Listen("tcp", "0.0.0.0:9092")
 	if err != nil {
@@ -153,204 +129,6 @@ func main() {
 		}
 		go handleConn(conn)
 	}
-}
-
-func readVarintZigZag(data []byte, idx *int) (int, error) {
-	var u uint64
-	var shift uint
-	for {
-		if *idx >= len(data) {
-			return 0, io.ErrUnexpectedEOF
-		}
-		b := data[*idx]
-		*idx++
-		u |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-		if shift > 63 {
-			return 0, io.ErrUnexpectedEOF
-		}
-	}
-	// ZigZag decode
-	v := int64(u>>1) ^ -int64(u&1)
-	return int(v), nil
-}
-
-func readInt32(data []byte, idx *int) (int32, bool) {
-	if *idx+4 > len(data) {
-		return 0, false
-	}
-	v := int32(binary.BigEndian.Uint32(data[*idx : *idx+4]))
-	*idx += 4
-	return v, true
-}
-
-func readInt16(data []byte, idx *int) (int16, bool) {
-	if *idx+2 > len(data) {
-		return 0, false
-	}
-	v := int16(binary.BigEndian.Uint16(data[*idx : *idx+2]))
-	*idx += 2
-	return v, true
-}
-
-func readUUID(data []byte, idx *int) ([16]byte, bool) {
-	var u [16]byte
-	if *idx+16 > len(data) {
-		return u, false
-	}
-	copy(u[:], data[*idx:*idx+16])
-	*idx += 16
-	return u, true
-}
-
-func readInt32Array(data []byte, idx *int) ([]int32, bool) {
-	n, ok := readInt32(data, idx)
-	if !ok || n < 0 {
-		return nil, false
-	}
-	arr := make([]int32, n)
-	for i := int32(0); i < n; i++ {
-		v, ok := readInt32(data, idx)
-		if !ok {
-			return nil, false
-		}
-		arr[i] = v
-	}
-	return arr, true
-}
-
-func parseMetadataRecord(val []byte, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) {
-	if len(val) < 2 {
-		return
-	}
-	rtype := -1
-	version := -1
-	idx := 0
-	if (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
-		rtype = int(val[0])
-		version = int(val[1])
-		idx = 2
-	} else if len(val) >= 4 {
-		rt := int(binary.BigEndian.Uint16(val[0:2]))
-		ver := int(binary.BigEndian.Uint16(val[2:4]))
-		if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
-			rtype = rt
-			version = ver
-			idx = 4
-		}
-	}
-	if rtype == -1 || version != 0 {
-		return
-	}
-
-	switch rtype {
-	case 2: // TopicRecord
-		nameLen, ok := readInt16(val, &idx)
-		if !ok || nameLen < 0 {
-			return
-		}
-		if idx+int(nameLen) > len(val) {
-			return
-		}
-		name := string(val[idx : idx+int(nameLen)])
-		idx += int(nameLen)
-		uuid, ok := readUUID(val, &idx)
-		if !ok {
-			return
-		}
-		meta, ok := topicByUUID[uuid]
-		if !ok {
-			meta = &TopicMetadata{}
-			topicByUUID[uuid] = meta
-		}
-		meta.UUID = uuid
-		topicMap[name] = meta
-		topicByID[uuid] = name
-	case 3: // PartitionRecord
-		partitionID, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		topicID, ok := readUUID(val, &idx)
-		if !ok {
-			return
-		}
-		replicas, ok := readInt32Array(val, &idx)
-		if !ok {
-			return
-		}
-		isr, ok := readInt32Array(val, &idx)
-		if !ok {
-			return
-		}
-		if _, ok := readInt32Array(val, &idx); !ok { // removingReplicas
-			return
-		}
-		if _, ok := readInt32Array(val, &idx); !ok { // addingReplicas
-			return
-		}
-		leader, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		if _, ok := readInt32(val, &idx); !ok { // leaderEpoch
-			return
-		}
-		if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
-			return
-		}
-		// directories (array of UUIDs) - skip
-		dirCount, ok := readInt32(val, &idx)
-		if !ok || dirCount < 0 {
-			return
-		}
-		for i := int32(0); i < dirCount; i++ {
-			if _, ok := readUUID(val, &idx); !ok {
-				return
-			}
-		}
-
-		meta, ok := topicByUUID[topicID]
-		if !ok {
-			meta = &TopicMetadata{UUID: topicID}
-			topicByUUID[topicID] = meta
-		}
-		if name, ok := topicByID[topicID]; ok {
-			topicMap[name] = meta
-		}
-		meta.Partitions = append(meta.Partitions, PartitionMetadata{
-			ID:       partitionID,
-			Leader:   leader,
-			Replicas: replicas,
-			ISR:      isr,
-		})
-	}
-}
-
-func appendInt16(b []byte, v int16) []byte {
-	return append(b, byte(v>>8), byte(v))
-}
-
-func appendInt32(b []byte, v int32) []byte {
-	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
-}
-
-func appendCompactInt32Array(b []byte, arr []int32) []byte {
-	if len(arr) == 0 {
-		return append(b, 0x01)
-	}
-	if len(arr) > 126 {
-		// not expected in this stage; fall back to empty
-		return append(b, 0x01)
-	}
-	b = append(b, byte(len(arr)+1))
-	for _, v := range arr {
-		b = appendInt32(b, v)
-	}
-	return b
 }
 
 func handleConn(conn net.Conn) {
@@ -490,42 +268,22 @@ func handleConn(conn net.Conn) {
 			if topicFound && topicMeta != nil {
 				errorCode = 0
 				topicID = topicMeta.UUID
+				// Build partitions COMPACT_ARRAY with 1 partition
 				partitionsArray = make([]byte, 0)
-				partitionsArray = append(partitionsArray, byte(len(topicMeta.Partitions)+1)) // compact array length
-				if len(topicMeta.Partitions) == 0 {
-					partitionsArray = []byte{0x01}
-				} else {
-					for _, p := range topicMeta.Partitions {
-						partitionsArray = appendInt16(partitionsArray, 0)    // error_code
-						partitionsArray = appendInt32(partitionsArray, p.ID) // partition_index
-
-						leaderID := p.Leader
-						if leaderID <= 0 && len(p.Replicas) > 0 {
-							leaderID = p.Replicas[0]
-						}
-						if leaderID <= 0 {
-							leaderID = 1
-						}
-
-						partitionsArray = appendInt32(partitionsArray, leaderID) // leader_id
-						partitionsArray = appendInt32(partitionsArray, 0)        // leader_epoch
-
-						replicas := p.Replicas
-						if len(replicas) == 0 {
-							replicas = []int32{leaderID}
-						}
-						isr := p.ISR
-						if len(isr) == 0 {
-							isr = []int32{leaderID}
-						}
-
-						partitionsArray = appendCompactInt32Array(partitionsArray, replicas) // replica_nodes
-						partitionsArray = appendCompactInt32Array(partitionsArray, isr)      // isr_nodes
-						partitionsArray = append(partitionsArray, 0x01, 0x01, 0x01)           // eligible_leader_replicas, last_known_elr, offline_replicas
-						partitionsArray = append(partitionsArray, 0x00)                       // TAG_BUFFER
-					}
-				}
+				partitionsArray = append(partitionsArray, 0x02) // length byte (1 element)
+				// Partition element:
+				partitionsArray = append(partitionsArray, 0x00, 0x00) // error_code = 0
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // partition_index = 0
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // leader_id = 0
+				partitionsArray = append(partitionsArray, 0x01) // replicas COMPACT_ARRAY (1 element)
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // replica = 0
+				partitionsArray = append(partitionsArray, 0x00) // element tag buffer
+				partitionsArray = append(partitionsArray, 0x01) // isr COMPACT_ARRAY (1 element)
+				partitionsArray = append(partitionsArray, 0x00, 0x00, 0x00, 0x00) // isr = 0
+				partitionsArray = append(partitionsArray, 0x00) // element tag buffer
+				partitionsArray = append(partitionsArray, 0x00) // partition tag buffer
 			} else {
+				// topic unknown, partitions empty
 				partitionsArray = []byte{0x01} // empty partitions array
 			}
 
