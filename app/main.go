@@ -8,133 +8,6 @@ import (
 	"os"
 )
 
-type TopicMetadata struct {
-	UUID       [16]byte
-	Partitions []PartitionMetadata
-}
-
-type PartitionMetadata struct {
-	ID         int32
-	Leader     int32
-	LeaderEpoch int32
-	Replicas   []int32
-	ISR        []int32
-}
-
-// Global in-memory map: topic_name -> TopicMetadata
-var topicMap = make(map[string]*TopicMetadata)
-
-func loadClusterMetadataLog(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	// Map from topic UUID -> name (for partition records seen before topic records).
-	topicByID := make(map[[16]byte]string)
-	topicByUUID := make(map[[16]byte]*TopicMetadata)
-
-	for off := 0; off+12 <= len(data); {
-		batchLen := int(binary.BigEndian.Uint32(data[off+8 : off+12]))
-		if batchLen <= 0 || off+12+batchLen > len(data) {
-			break
-		}
-		batchEnd := off + 12 + batchLen
-		off += 12
-
-		if off+49 > len(data) {
-			break
-		}
-		magic := data[off+4]
-		if magic != 2 {
-			off = batchEnd
-			continue
-		}
-		recordsCount := binary.BigEndian.Uint32(data[off+45 : off+49])
-		off += 49
-
-		for i := uint32(0); i < recordsCount && off < batchEnd; i++ {
-			// Record length is unsigned varint (not zigzag).
-			recordLenU, err := readUvarint(data, &off)
-			if err != nil {
-				break
-			}
-			recordLen := int(recordLenU)
-			if recordLen <= 0 {
-				break
-			}
-			recordEnd := off + recordLen
-			if recordEnd > batchEnd {
-				break
-			}
-			// attributes
-			off++
-			// timestampDelta, offsetDelta
-			if _, err := readVarintZigZag(data, &off); err != nil {
-				break
-			}
-			if _, err := readVarintZigZag(data, &off); err != nil {
-				break
-			}
-			// key
-			keyLen, err := readVarintZigZag(data, &off)
-			if err != nil {
-				break
-			}
-			var key []byte
-			if keyLen >= 0 {
-				if off+keyLen > recordEnd {
-					break
-				}
-				key = data[off : off+keyLen]
-				off += keyLen
-			}
-			// value
-			valLen, err := readVarintZigZag(data, &off)
-			if err != nil {
-				break
-			}
-			var val []byte
-			if valLen >= 0 {
-				if off+valLen > recordEnd {
-					break
-				}
-				val = data[off : off+valLen]
-				off += valLen
-			}
-			// headers
-			hCount, err := readVarintZigZag(data, &off)
-			if err != nil {
-				break
-			}
-			for h := 0; h < hCount; h++ {
-				hKeyLen, err := readVarintZigZag(data, &off)
-				if err != nil {
-					break
-				}
-				if hKeyLen > 0 {
-					off += hKeyLen
-				}
-				hValLen, err := readVarintZigZag(data, &off)
-				if err != nil {
-					break
-				}
-				if hValLen > 0 {
-					off += hValLen
-				}
-			}
-
-			if len(val) > 0 {
-				parseMetadataRecord(key, val, topicByID, topicByUUID)
-			}
-
-			off = recordEnd
-		}
-		off = batchEnd
-	}
-	return nil
-}
-
 func main() {
 	fmt.Println("Logs from your program will appear here!")
 	_ = loadClusterMetadataLog("/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log")
@@ -153,368 +26,6 @@ func main() {
 		}
 		go handleConn(conn)
 	}
-}
-
-func readVarintZigZag(data []byte, idx *int) (int, error) {
-	var u uint64
-	var shift uint
-	for {
-		if *idx >= len(data) {
-			return 0, io.ErrUnexpectedEOF
-		}
-		b := data[*idx]
-		*idx++
-		u |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-		if shift > 63 {
-			return 0, io.ErrUnexpectedEOF
-		}
-	}
-	v := int64(u>>1) ^ -int64(u&1)
-	return int(v), nil
-}
-
-func readUvarint(data []byte, idx *int) (uint64, error) {
-	var u uint64
-	var shift uint
-	for {
-		if *idx >= len(data) {
-			return 0, io.ErrUnexpectedEOF
-		}
-		b := data[*idx]
-		*idx++
-		u |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-		if shift > 63 {
-			return 0, io.ErrUnexpectedEOF
-		}
-	}
-	return u, nil
-}
-
-func readInt16(data []byte, idx *int) (int16, bool) {
-	if *idx+2 > len(data) {
-		return 0, false
-	}
-	v := int16(binary.BigEndian.Uint16(data[*idx : *idx+2]))
-	*idx += 2
-	return v, true
-}
-
-func readInt32(data []byte, idx *int) (int32, bool) {
-	if *idx+4 > len(data) {
-		return 0, false
-	}
-	v := int32(binary.BigEndian.Uint32(data[*idx : *idx+4]))
-	*idx += 4
-	return v, true
-}
-
-func readUUID(data []byte, idx *int) ([16]byte, bool) {
-	var u [16]byte
-	if *idx+16 > len(data) {
-		return u, false
-	}
-	copy(u[:], data[*idx:*idx+16])
-	*idx += 16
-	return u, true
-}
-
-func readInt32Array(data []byte, idx *int) ([]int32, bool) {
-	n, ok := readInt32(data, idx)
-	if !ok || n < 0 {
-		return nil, false
-	}
-	arr := make([]int32, n)
-	for i := int32(0); i < n; i++ {
-		v, ok := readInt32(data, idx)
-		if !ok {
-			return nil, false
-		}
-		arr[i] = v
-	}
-	return arr, true
-}
-
-func readCompactString(data []byte, idx *int) (string, bool) {
-	nPlus, err := readUvarint(data, idx)
-	if err != nil {
-		return "", false
-	}
-	if nPlus == 0 {
-		return "", false
-	}
-	n := int(nPlus - 1)
-	if *idx+n > len(data) {
-		return "", false
-	}
-	s := string(data[*idx : *idx+n])
-	*idx += n
-	return s, true
-}
-
-func readCompactInt32Array(data []byte, idx *int) ([]int32, bool) {
-	nPlus, err := readUvarint(data, idx)
-	if err != nil {
-		return nil, false
-	}
-	if nPlus == 0 {
-		return nil, false
-	}
-	n := int32(nPlus - 1)
-	arr := make([]int32, n)
-	for i := int32(0); i < n; i++ {
-		v, ok := readInt32(data, idx)
-		if !ok {
-			return nil, false
-		}
-		arr[i] = v
-	}
-	return arr, true
-}
-
-func readCompactUUIDArray(data []byte, idx *int) (int, bool) {
-	nPlus, err := readUvarint(data, idx)
-	if err != nil {
-		return 0, false
-	}
-	if nPlus == 0 {
-		return 0, false
-	}
-	n := int(nPlus - 1)
-	for i := 0; i < n; i++ {
-		if _, ok := readUUID(data, idx); !ok {
-			return 0, false
-		}
-	}
-	return n, true
-}
-
-func skipTaggedFields(data []byte, idx *int) bool {
-	numTags, err := readUvarint(data, idx)
-	if err != nil {
-		return false
-	}
-	for i := uint64(0); i < numTags; i++ {
-		if _, err := readUvarint(data, idx); err != nil { // tag id
-			return false
-		}
-		size, err := readUvarint(data, idx)
-		if err != nil {
-			return false
-		}
-		if *idx+int(size) > len(data) {
-			return false
-		}
-		*idx += int(size)
-	}
-	return true
-}
-
-func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) {
-	if len(val) < 2 && len(key) < 2 {
-		return
-	}
-	rtype := -1
-	version := -1
-	idx := 0
-	// Prefer type/version from record key if present.
-	if len(key) >= 4 {
-		rt := int(binary.BigEndian.Uint16(key[0:2]))
-		ver := int(binary.BigEndian.Uint16(key[2:4]))
-		if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
-			rtype = rt
-			version = ver
-			idx = 0
-		}
-	} else if len(key) == 2 {
-		rt := int(binary.BigEndian.Uint16(key[0:2]))
-		if rt == 2 || rt == 3 {
-			rtype = rt
-			version = 0
-			idx = 0
-		}
-	} else if len(key) == 1 {
-		rt := int(key[0])
-		if rt == 2 || rt == 3 {
-			rtype = rt
-			version = 0
-			idx = 0
-		}
-	}
-	// Fallback to prefix in value if key didn't provide it.
-	if rtype == -1 {
-		if len(val) >= 2 && (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
-			rtype = int(val[0])
-			version = int(val[1])
-			idx = 2
-		} else if len(val) >= 4 {
-			rt := int(binary.BigEndian.Uint16(val[0:2]))
-			ver := int(binary.BigEndian.Uint16(val[2:4]))
-			if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
-				rtype = rt
-				version = ver
-				idx = 4
-			}
-		}
-	}
-	if rtype == -1 || (version != 0 && version != 1) {
-		return
-	}
-
-	switch rtype {
-	case 2: // TopicRecord v0
-		var name string
-		var ok bool
-		if version == 0 {
-			nameLen, ok := readInt16(val, &idx)
-			if !ok || nameLen < 0 {
-				return
-			}
-			if idx+int(nameLen) > len(val) {
-				return
-			}
-			name = string(val[idx : idx+int(nameLen)])
-			idx += int(nameLen)
-		} else {
-			name, ok = readCompactString(val, &idx)
-			if !ok {
-				return
-			}
-		}
-		uuid, ok := readUUID(val, &idx)
-		if !ok {
-			return
-		}
-		if version == 1 {
-			if !skipTaggedFields(val, &idx) {
-				return
-			}
-		}
-		meta, ok := topicByUUID[uuid]
-		if !ok {
-			meta = &TopicMetadata{}
-			topicByUUID[uuid] = meta
-		}
-		meta.UUID = uuid
-		topicMap[name] = meta
-		topicByID[uuid] = name
-	case 3: // PartitionRecord v0
-		partitionID, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		topicID, ok := readUUID(val, &idx)
-		if !ok {
-			return
-		}
-		var replicas []int32
-		var isr []int32
-		if version == 0 {
-			replicas, ok = readInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-			isr, ok = readInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-			if _, ok := readInt32Array(val, &idx); !ok { // removingReplicas
-				return
-			}
-			if _, ok := readInt32Array(val, &idx); !ok { // addingReplicas
-				return
-			}
-		} else {
-			replicas, ok = readCompactInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-			isr, ok = readCompactInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-			if _, ok := readCompactInt32Array(val, &idx); !ok { // removingReplicas
-				return
-			}
-			if _, ok := readCompactInt32Array(val, &idx); !ok { // addingReplicas
-				return
-			}
-		}
-		leader, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		leaderEpoch, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
-			return
-		}
-		if version == 0 {
-			dirCount, ok := readInt32(val, &idx)
-			if !ok || dirCount < 0 {
-				return
-			}
-			for i := int32(0); i < dirCount; i++ {
-				if _, ok := readUUID(val, &idx); !ok {
-					return
-				}
-			}
-		} else {
-			if _, ok := readCompactUUIDArray(val, &idx); !ok {
-				return
-			}
-			if !skipTaggedFields(val, &idx) {
-				return
-			}
-		}
-
-		meta, ok := topicByUUID[topicID]
-		if !ok {
-			meta = &TopicMetadata{UUID: topicID}
-			topicByUUID[topicID] = meta
-		}
-		if name, ok := topicByID[topicID]; ok {
-			topicMap[name] = meta
-		}
-		meta.Partitions = append(meta.Partitions, PartitionMetadata{
-			ID:          partitionID,
-			Leader:      leader,
-			LeaderEpoch: leaderEpoch,
-			Replicas:    replicas,
-			ISR:         isr,
-		})
-	}
-}
-
-func appendInt16(b []byte, v int16) []byte {
-	return append(b, byte(v>>8), byte(v))
-}
-
-func appendInt32(b []byte, v int32) []byte {
-	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
-}
-
-func appendCompactInt32Array(b []byte, arr []int32) []byte {
-	if len(arr) == 0 {
-		return append(b, 0x01)
-	}
-	if len(arr) > 126 {
-		return append(b, 0x01)
-	}
-	b = append(b, byte(len(arr)+1))
-	for _, v := range arr {
-		b = appendInt32(b, v)
-	}
-	return b
 }
 
 func handleConn(conn net.Conn) {
@@ -551,7 +62,6 @@ func handleConn(conn net.Conn) {
 		// Parse api_version (2 bytes at offset 2-3)
 		requestAPIVersion := binary.BigEndian.Uint16(payload[2:4])
 		fmt.Printf("Parsed request_api_key: %d, request_api_version: %d\n", requestAPIKey, requestAPIVersion)
-
 
 		// Parse correlation_id (4 bytes at offset 4-7)
 		correlationID := binary.BigEndian.Uint32(payload[4:8])
@@ -645,7 +155,7 @@ func handleConn(conn net.Conn) {
 			// Build DescribeTopicPartitions v0 response body
 			responseBody := make([]byte, 0)
 			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00) // throttle_time_ms = 0
-			responseBody = append(responseBody, 0x02) // topics COMPACT_ARRAY with 1 element
+			responseBody = append(responseBody, 0x02)                   // topics COMPACT_ARRAY with 1 element
 
 			// Topic element:
 			var errorCode uint16 = 3 // unknown topic
@@ -659,7 +169,7 @@ func handleConn(conn net.Conn) {
 				} else {
 					p := topicMeta.Partitions[0]
 					partitionsArray = make([]byte, 0)
-					partitionsArray = append(partitionsArray, 0x02) // length byte (1 element)
+					partitionsArray = append(partitionsArray, 0x02)      // length byte (1 element)
 					partitionsArray = appendInt16(partitionsArray, 0)    // error_code
 					partitionsArray = appendInt32(partitionsArray, p.ID) // partition_index
 
@@ -670,7 +180,7 @@ func handleConn(conn net.Conn) {
 					if leaderID == 0 {
 						leaderID = 1
 					}
-					partitionsArray = appendInt32(partitionsArray, leaderID)    // leader_id
+					partitionsArray = appendInt32(partitionsArray, leaderID)      // leader_id
 					partitionsArray = appendInt32(partitionsArray, p.LeaderEpoch) // leader_epoch
 
 					replicas := p.Replicas
@@ -683,8 +193,8 @@ func handleConn(conn net.Conn) {
 					}
 					partitionsArray = appendCompactInt32Array(partitionsArray, replicas) // replica_nodes
 					partitionsArray = appendCompactInt32Array(partitionsArray, isr)      // isr_nodes
-					partitionsArray = append(partitionsArray, 0x01, 0x01, 0x01)           // eligible_leader_replicas, last_known_elr, offline_replicas
-					partitionsArray = append(partitionsArray, 0x00)                       // TAG_BUFFER
+					partitionsArray = append(partitionsArray, 0x01, 0x01, 0x01)          // eligible_leader_replicas, last_known_elr, offline_replicas
+					partitionsArray = append(partitionsArray, 0x00)                      // TAG_BUFFER
 				}
 			} else {
 				partitionsArray = []byte{0x01} // empty partitions array
@@ -695,12 +205,12 @@ func handleConn(conn net.Conn) {
 			responseBody = append(responseBody, byte(topicNameLen+1))
 			responseBody = append(responseBody, []byte(topicName)...)
 			responseBody = append(responseBody, topicID[:]...) // topic_id
-			responseBody = append(responseBody, 0x00) // is_internal = 0
+			responseBody = append(responseBody, 0x00)          // is_internal = 0
 			responseBody = append(responseBody, partitionsArray...)
 			responseBody = append(responseBody, 0x00, 0x00, 0x00, 0x00) // topic_authorized_operations
-			responseBody = append(responseBody, 0x00) // topic TAG_BUFFER
-			responseBody = append(responseBody, 0xFF) // next_cursor = NULLABLE_INT8 = -1
-			responseBody = append(responseBody, 0x00) // response TAG_BUFFER
+			responseBody = append(responseBody, 0x00)                   // topic TAG_BUFFER
+			responseBody = append(responseBody, 0xFF)                   // next_cursor = NULLABLE_INT8 = -1
+			responseBody = append(responseBody, 0x00)                   // response TAG_BUFFER
 
 			messageSize := uint32(5 + len(responseBody)) // header v1 (5) + body
 			sizeOut := make([]byte, 4)
@@ -734,15 +244,15 @@ func handleConn(conn net.Conn) {
 			// Build ApiVersions v4 response body:
 			responseBody := []byte{
 				byte(errorCode >> 8), byte(errorCode), // error_code (2)
-				0x03, // api_keys compact array length (2 elements, zigzag encoded)
+				0x03,       // api_keys compact array length (2 elements, zigzag encoded)
 				0x00, 0x12, // api_key 18
 				0x00, 0x00, // min_version 0
 				0x00, 0x04, // max_version 4
-				0x00, // element tag buffer
+				0x00,       // element tag buffer
 				0x00, 0x4B, // api_key 75
 				0x00, 0x00, // min_version 0
 				0x00, 0x00, // max_version 0
-				0x00, // element tag buffer
+				0x00,                   // element tag buffer
 				0x00, 0x00, 0x00, 0x00, // throttle_time_ms
 				0x00, // response tag buffer
 			}
@@ -763,6 +273,6 @@ func handleConn(conn net.Conn) {
 				fmt.Println("Error writing response body: ", err.Error())
 				break
 			}
-		}	
+		}
 	}
 }
