@@ -54,8 +54,13 @@ func loadClusterMetadataLog(path string) error {
 		off += 49
 
 		for i := uint32(0); i < recordsCount && off < batchEnd; i++ {
-			recordLen, err := readVarintZigZag(data, &off)
-			if err != nil || recordLen <= 0 {
+			// Record length is unsigned varint (not zigzag).
+			recordLenU, err := readUvarint(data, &off)
+			if err != nil {
+				break
+			}
+			recordLen := int(recordLenU)
+			if recordLen <= 0 {
 				break
 			}
 			recordEnd := off + recordLen
