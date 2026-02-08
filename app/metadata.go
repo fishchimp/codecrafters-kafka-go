@@ -169,33 +169,22 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 
 	switch rtype {
 	case 2: // TopicRecord v0/v1
-		var name string
-		var ok bool
-		if version == 0 {
-			nameLen, ok := readInt16(val, &idx)
-			if !ok || nameLen < 0 {
-				return
-			}
-			if idx+int(nameLen) > len(val) {
+		// TopicRecord in KRaft metadata is flexible; prefer compact string.
+		name, ok := readCompactString(val, &idx)
+		if !ok {
+			// Fallback to non-compact string if needed.
+			nameLen, ok2 := readInt16(val, &idx)
+			if !ok2 || nameLen < 0 || idx+int(nameLen) > len(val) {
 				return
 			}
 			name = string(val[idx : idx+int(nameLen)])
 			idx += int(nameLen)
-		} else {
-			name, ok = readCompactString(val, &idx)
-			if !ok {
-				return
-			}
 		}
 		uuid, ok := readUUID(val, &idx)
 		if !ok {
 			return
 		}
-		if version == 1 {
-			if !skipTaggedFields(val, &idx) {
-				return
-			}
-		}
+		_ = skipTaggedFields(val, &idx)
 		meta, ok := topicByUUID[uuid]
 		if !ok {
 			meta = &TopicMetadata{}
@@ -215,34 +204,28 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 		}
 		var replicas []int32
 		var isr []int32
-		if version == 0 {
+		// KRaft metadata records are flexible; prefer compact arrays.
+		replicas, ok = readCompactInt32Array(val, &idx)
+		if !ok {
 			replicas, ok = readInt32Array(val, &idx)
 			if !ok {
 				return
 			}
+		}
+		isr, ok = readCompactInt32Array(val, &idx)
+		if !ok {
 			isr, ok = readInt32Array(val, &idx)
 			if !ok {
 				return
 			}
-			if _, ok := readInt32Array(val, &idx); !ok { // removingReplicas
+		}
+		if _, ok = readCompactInt32Array(val, &idx); !ok { // removingReplicas
+			if _, ok = readInt32Array(val, &idx); !ok {
 				return
 			}
-			if _, ok := readInt32Array(val, &idx); !ok { // addingReplicas
-				return
-			}
-		} else {
-			replicas, ok = readCompactInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-			isr, ok = readCompactInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-			if _, ok := readCompactInt32Array(val, &idx); !ok { // removingReplicas
-				return
-			}
-			if _, ok := readCompactInt32Array(val, &idx); !ok { // addingReplicas
+		}
+		if _, ok = readCompactInt32Array(val, &idx); !ok { // addingReplicas
+			if _, ok = readInt32Array(val, &idx); !ok {
 				return
 			}
 		}
@@ -257,9 +240,9 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 		if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
 			return
 		}
-		if version == 0 {
-			dirCount, ok := readInt32(val, &idx)
-			if !ok || dirCount < 0 {
+		if _, ok := readCompactUUIDArray(val, &idx); !ok {
+			dirCount, ok2 := readInt32(val, &idx)
+			if !ok2 || dirCount < 0 {
 				return
 			}
 			for i := int32(0); i < dirCount; i++ {
@@ -267,14 +250,8 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 					return
 				}
 			}
-		} else {
-			if _, ok := readCompactUUIDArray(val, &idx); !ok {
-				return
-			}
-			if !skipTaggedFields(val, &idx) {
-				return
-			}
 		}
+		_ = skipTaggedFields(val, &idx)
 
 		meta, ok := topicByUUID[topicID]
 		if !ok {
