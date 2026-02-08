@@ -81,10 +81,12 @@ func loadClusterMetadataLog(path string) error {
 			if err != nil {
 				break
 			}
+			var key []byte
 			if keyLen >= 0 {
 				if off+keyLen > recordEnd {
 					break
 				}
+				key = data[off : off+keyLen]
 				off += keyLen
 			}
 			// value
@@ -123,7 +125,7 @@ func loadClusterMetadataLog(path string) error {
 			}
 
 			if len(val) > 0 {
-				parseMetadataRecord(val, topicByID, topicByUUID)
+				parseMetadataRecord(key, val, topicByID, topicByUUID)
 			}
 
 			off = recordEnd
@@ -315,24 +317,51 @@ func skipTaggedFields(data []byte, idx *int) bool {
 	return true
 }
 
-func parseMetadataRecord(val []byte, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) {
-	if len(val) < 2 {
+func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) {
+	if len(val) < 2 && len(key) < 2 {
 		return
 	}
 	rtype := -1
 	version := -1
 	idx := 0
-	if (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
-		rtype = int(val[0])
-		version = int(val[1])
-		idx = 2
-	} else if len(val) >= 4 {
-		rt := int(binary.BigEndian.Uint16(val[0:2]))
-		ver := int(binary.BigEndian.Uint16(val[2:4]))
+	// Prefer type/version from record key if present.
+	if len(key) >= 4 {
+		rt := int(binary.BigEndian.Uint16(key[0:2]))
+		ver := int(binary.BigEndian.Uint16(key[2:4]))
 		if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
 			rtype = rt
 			version = ver
-			idx = 4
+			idx = 0
+		}
+	} else if len(key) == 2 {
+		rt := int(binary.BigEndian.Uint16(key[0:2]))
+		if rt == 2 || rt == 3 {
+			rtype = rt
+			version = 0
+			idx = 0
+		}
+	} else if len(key) == 1 {
+		rt := int(key[0])
+		if rt == 2 || rt == 3 {
+			rtype = rt
+			version = 0
+			idx = 0
+		}
+	}
+	// Fallback to prefix in value if key didn't provide it.
+	if rtype == -1 {
+		if len(val) >= 2 && (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
+			rtype = int(val[0])
+			version = int(val[1])
+			idx = 2
+		} else if len(val) >= 4 {
+			rt := int(binary.BigEndian.Uint16(val[0:2]))
+			ver := int(binary.BigEndian.Uint16(val[2:4]))
+			if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
+				rtype = rt
+				version = ver
+				idx = 4
+			}
 		}
 	}
 	if rtype == -1 || (version != 0 && version != 1) {
