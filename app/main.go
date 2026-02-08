@@ -299,7 +299,7 @@ func handleConn(conn net.Conn) {
 			responseBody = append(responseBody, 0xFF) // next_cursor = NULLABLE_INT8 = -1
 			responseBody = append(responseBody, 0x00) // response TAG_BUFFER
 
-			messageSize := uint32(len(header) + len(responseBody)) // header v1 (5) + body
+			messageSize := uint32(5 + len(responseBody)) // header v1 (5) + body
 			sizeOut := make([]byte, 4)
 			binary.BigEndian.PutUint32(sizeOut, messageSize)
 			if _, err := conn.Write(sizeOut); err != nil {
