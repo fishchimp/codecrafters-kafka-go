@@ -160,6 +160,16 @@ func handleConn(conn net.Conn) {
 				}
 				topicMeta, topicFound = topicMap[topicName]
 			}
+			if !topicFound {
+				// Last-resort tolerant scan for this topic in metadata log.
+				meta, ok, err := lookupTopicMetadataFromLog(clusterMetadataLogPath, topicName)
+				if err != nil {
+					fmt.Printf("Metadata direct lookup failed: %v\n", err)
+				} else if ok && meta != nil {
+					topicMap[topicName] = meta
+					topicMeta, topicFound = meta, true
+				}
+			}
 		}
 
 		if requestAPIKey == 75 {
