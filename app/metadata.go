@@ -179,7 +179,10 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 
 	starts := []int{idx}
 	if rtypeFromKey && idx == 0 {
-		starts = append(starts, 1)
+		// Key can carry type/version while value still includes a framed prefix:
+		// frame_version (1), record_type (1), record_version (1).
+		// Try decoding payload after that prefix first.
+		starts = append(starts, 3, 1)
 	}
 
 	switch rtype {
