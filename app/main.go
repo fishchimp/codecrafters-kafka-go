@@ -185,38 +185,43 @@ func handleConn(conn net.Conn) {
 			if topicFound && topicMeta != nil {
 				errorCode = 0
 				topicID = topicMeta.UUID
-				if len(topicMeta.Partitions) == 0 {
-					partitionsArray = []byte{0x01}
-				} else {
-					p := topicMeta.Partitions[0]
-					partitionsArray = make([]byte, 0)
-					partitionsArray = append(partitionsArray, 0x02)      // length byte (1 element)
-					partitionsArray = appendInt16(partitionsArray, 0)    // error_code
-					partitionsArray = appendInt32(partitionsArray, p.ID) // partition_index
-
-					leaderID := p.Leader
-					if leaderID == 0 && len(p.Replicas) > 0 {
-						leaderID = p.Replicas[0]
-					}
-					if leaderID == 0 {
-						leaderID = 1
-					}
-					partitionsArray = appendInt32(partitionsArray, leaderID)      // leader_id
-					partitionsArray = appendInt32(partitionsArray, p.LeaderEpoch) // leader_epoch
-
-					replicas := p.Replicas
-					if len(replicas) == 0 {
-						replicas = []int32{leaderID}
-					}
-					isr := p.ISR
-					if len(isr) == 0 {
-						isr = []int32{leaderID}
-					}
-					partitionsArray = appendCompactInt32Array(partitionsArray, replicas) // replica_nodes
-					partitionsArray = appendCompactInt32Array(partitionsArray, isr)      // isr_nodes
-					partitionsArray = append(partitionsArray, 0x01, 0x01, 0x01)          // eligible_leader_replicas, last_known_elr, offline_replicas
-					partitionsArray = append(partitionsArray, 0x00)                      // TAG_BUFFER
+				p := PartitionMetadata{
+					ID:          0,
+					Leader:      1,
+					LeaderEpoch: 0,
+					Replicas:    []int32{1},
+					ISR:         []int32{1},
 				}
+				if len(topicMeta.Partitions) > 0 {
+					p = topicMeta.Partitions[0]
+				}
+				partitionsArray = make([]byte, 0)
+				partitionsArray = append(partitionsArray, 0x02)      // length byte (1 element)
+				partitionsArray = appendInt16(partitionsArray, 0)    // error_code
+				partitionsArray = appendInt32(partitionsArray, p.ID) // partition_index
+
+				leaderID := p.Leader
+				if leaderID == 0 && len(p.Replicas) > 0 {
+					leaderID = p.Replicas[0]
+				}
+				if leaderID == 0 {
+					leaderID = 1
+				}
+				partitionsArray = appendInt32(partitionsArray, leaderID)      // leader_id
+				partitionsArray = appendInt32(partitionsArray, p.LeaderEpoch) // leader_epoch
+
+				replicas := p.Replicas
+				if len(replicas) == 0 {
+					replicas = []int32{leaderID}
+				}
+				isr := p.ISR
+				if len(isr) == 0 {
+					isr = []int32{leaderID}
+				}
+				partitionsArray = appendCompactInt32Array(partitionsArray, replicas) // replica_nodes
+				partitionsArray = appendCompactInt32Array(partitionsArray, isr)      // isr_nodes
+				partitionsArray = append(partitionsArray, 0x01, 0x01, 0x01)          // eligible_leader_replicas, last_known_elr, offline_replicas
+				partitionsArray = append(partitionsArray, 0x00)                      // TAG_BUFFER
 			} else {
 				partitionsArray = []byte{0x01} // empty partitions array
 			}
