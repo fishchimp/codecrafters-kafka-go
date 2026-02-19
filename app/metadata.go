@@ -125,10 +125,15 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 	idx := 0
 	rtypeFromKey := false
 	// Prefer type/version from record key if present.
-	if len(key) >= 4 {
+	if len(key) >= 3 && key[0] == 0 && (key[1] == 2 || key[1] == 3) {
+		rtype = int(key[1])
+		version = int(key[2])
+		idx = 0
+		rtypeFromKey = true
+	} else if len(key) >= 4 {
 		rt := int(binary.BigEndian.Uint16(key[0:2]))
 		ver := int(binary.BigEndian.Uint16(key[2:4]))
-		if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
+		if rt == 2 || rt == 3 {
 			rtype = rt
 			version = ver
 			idx = 0
@@ -153,29 +158,30 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 	}
 	// Fallback to prefix in value if key didn't provide it.
 	if rtype == -1 {
-		if len(val) >= 3 && val[0] == 0 && (val[1] == 2 || val[1] == 3) && (val[2] == 0 || val[2] == 1) {
+		if len(val) >= 3 && val[0] == 0 && (val[1] == 2 || val[1] == 3) {
 			// Newer metadata values can include:
 			// frame_version (1 byte), record_type (1 byte), record_version (1 byte).
 			rtype = int(val[1])
 			version = int(val[2])
 			idx = 3
-		} else if len(val) >= 2 && (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
+		} else if len(val) >= 2 && (val[0] == 2 || val[0] == 3) {
 			rtype = int(val[0])
 			version = int(val[1])
 			idx = 2
 		} else if len(val) >= 4 {
 			rt := int(binary.BigEndian.Uint16(val[0:2]))
 			ver := int(binary.BigEndian.Uint16(val[2:4]))
-			if (rt == 2 || rt == 3) && (ver == 0 || ver == 1) {
+			if rt == 2 || rt == 3 {
 				rtype = rt
 				version = ver
 				idx = 4
 			}
 		}
 	}
-	if rtype == -1 || (version != 0 && version != 1) {
+	if rtype == -1 {
 		return
 	}
+	_ = version
 
 	starts := []int{idx}
 	if rtypeFromKey && idx == 0 {
@@ -222,7 +228,6 @@ func tryParseTopicRecord(val []byte, start int, topicByID map[[16]byte]string, t
 	if !ok {
 		return false
 	}
-	_ = skipTaggedFields(val, &idx)
 
 	meta, ok := topicByUUID[uuid]
 	if !ok {
@@ -284,21 +289,6 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 	if !ok {
 		return false
 	}
-	if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
-		return false
-	}
-	if _, ok := readCompactUUIDArray(val, &idx); !ok {
-		dirCount, ok2 := readInt32(val, &idx)
-		if !ok2 || dirCount < 0 {
-			return false
-		}
-		for i := int32(0); i < dirCount; i++ {
-			if _, ok := readUUID(val, &idx); !ok {
-				return false
-			}
-		}
-	}
-	_ = skipTaggedFields(val, &idx)
 
 	meta, ok := topicByUUID[topicID]
 	if !ok {
