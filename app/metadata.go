@@ -188,7 +188,7 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 		// Key can carry type/version while value still includes a framed prefix:
 		// frame_version (1), record_type (1), record_version (1).
 		// Try decoding payload after that prefix first.
-		starts = append(starts, 3, 1)
+		starts = append(starts, 4, 3, 2, 1)
 	}
 
 	switch rtype {
@@ -228,6 +228,9 @@ func tryParseTopicRecord(val []byte, start int, topicByID map[[16]byte]string, t
 	if !ok {
 		return false
 	}
+	if isZeroUUID(uuid) {
+		return false
+	}
 
 	meta, ok := topicByUUID[uuid]
 	if !ok {
@@ -252,6 +255,9 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 	}
 	topicID, ok := readUUID(val, &idx)
 	if !ok {
+		return false
+	}
+	if isZeroUUID(topicID) {
 		return false
 	}
 	var replicas []int32
@@ -305,5 +311,14 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 		Replicas:    replicas,
 		ISR:         isr,
 	})
+	return true
+}
+
+func isZeroUUID(u [16]byte) bool {
+	for _, b := range u {
+		if b != 0 {
+			return false
+		}
+	}
 	return true
 }
