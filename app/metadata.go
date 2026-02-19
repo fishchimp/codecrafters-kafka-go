@@ -123,6 +123,7 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 	rtype := -1
 	version := -1
 	idx := 0
+	rtypeFromKey := false
 	// Prefer type/version from record key if present.
 	if len(key) >= 4 {
 		rt := int(binary.BigEndian.Uint16(key[0:2]))
@@ -131,6 +132,7 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 			rtype = rt
 			version = ver
 			idx = 0
+			rtypeFromKey = true
 		}
 	} else if len(key) == 2 {
 		rt := int(binary.BigEndian.Uint16(key[0:2]))
@@ -138,6 +140,7 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 			rtype = rt
 			version = 0
 			idx = 0
+			rtypeFromKey = true
 		}
 	} else if len(key) == 1 {
 		rt := int(key[0])
@@ -145,6 +148,7 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 			rtype = rt
 			version = 0
 			idx = 0
+			rtypeFromKey = true
 		}
 	}
 	// Fallback to prefix in value if key didn't provide it.
@@ -173,106 +177,140 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 		return
 	}
 
+	starts := []int{idx}
+	if rtypeFromKey && idx == 0 {
+		starts = append(starts, 1)
+	}
+
 	switch rtype {
 	case 2: // TopicRecord v0/v1
-		// TopicRecord in KRaft metadata is flexible; prefer compact string.
-		name, ok := readCompactString(val, &idx)
-		if !ok {
-			// Fallback to non-compact string if needed.
-			nameLen, ok2 := readInt16(val, &idx)
-			if !ok2 || nameLen < 0 || idx+int(nameLen) > len(val) {
+		for _, start := range starts {
+			if tryParseTopicRecord(val, start, topicByID, topicByUUID) {
 				return
 			}
-			name = string(val[idx : idx+int(nameLen)])
-			idx += int(nameLen)
 		}
-		uuid, ok := readUUID(val, &idx)
-		if !ok {
-			return
-		}
-		_ = skipTaggedFields(val, &idx)
-		meta, ok := topicByUUID[uuid]
-		if !ok {
-			meta = &TopicMetadata{}
-			topicByUUID[uuid] = meta
-		}
-		meta.UUID = uuid
-		topicMap[name] = meta
-		topicByID[uuid] = name
 	case 3: // PartitionRecord v0/v1
-		partitionID, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		topicID, ok := readUUID(val, &idx)
-		if !ok {
-			return
-		}
-		var replicas []int32
-		var isr []int32
-		// KRaft metadata records are flexible; prefer compact arrays.
-		replicas, ok = readCompactInt32Array(val, &idx)
-		if !ok {
-			replicas, ok = readInt32Array(val, &idx)
-			if !ok {
+		for _, start := range starts {
+			if tryParsePartitionRecord(val, start, topicByID, topicByUUID) {
 				return
 			}
 		}
-		isr, ok = readCompactInt32Array(val, &idx)
-		if !ok {
-			isr, ok = readInt32Array(val, &idx)
-			if !ok {
-				return
-			}
-		}
-		if _, ok = readCompactInt32Array(val, &idx); !ok { // removingReplicas
-			if _, ok = readInt32Array(val, &idx); !ok {
-				return
-			}
-		}
-		if _, ok = readCompactInt32Array(val, &idx); !ok { // addingReplicas
-			if _, ok = readInt32Array(val, &idx); !ok {
-				return
-			}
-		}
-		leader, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		leaderEpoch, ok := readInt32(val, &idx)
-		if !ok {
-			return
-		}
-		if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
-			return
-		}
-		if _, ok := readCompactUUIDArray(val, &idx); !ok {
-			dirCount, ok2 := readInt32(val, &idx)
-			if !ok2 || dirCount < 0 {
-				return
-			}
-			for i := int32(0); i < dirCount; i++ {
-				if _, ok := readUUID(val, &idx); !ok {
-					return
-				}
-			}
-		}
-		_ = skipTaggedFields(val, &idx)
-
-		meta, ok := topicByUUID[topicID]
-		if !ok {
-			meta = &TopicMetadata{UUID: topicID}
-			topicByUUID[topicID] = meta
-		}
-		if name, ok := topicByID[topicID]; ok {
-			topicMap[name] = meta
-		}
-		meta.Partitions = append(meta.Partitions, PartitionMetadata{
-			ID:          partitionID,
-			Leader:      leader,
-			LeaderEpoch: leaderEpoch,
-			Replicas:    replicas,
-			ISR:         isr,
-		})
 	}
+}
+
+func tryParseTopicRecord(val []byte, start int, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) bool {
+	if start < 0 || start >= len(val) {
+		return false
+	}
+	idx := start
+
+	// TopicRecord in KRaft metadata is flexible; prefer compact string.
+	name, ok := readCompactString(val, &idx)
+	if !ok {
+		// Fallback to non-compact string if needed.
+		nameLen, ok2 := readInt16(val, &idx)
+		if !ok2 || nameLen < 0 || idx+int(nameLen) > len(val) {
+			return false
+		}
+		name = string(val[idx : idx+int(nameLen)])
+		idx += int(nameLen)
+	}
+	uuid, ok := readUUID(val, &idx)
+	if !ok {
+		return false
+	}
+	_ = skipTaggedFields(val, &idx)
+
+	meta, ok := topicByUUID[uuid]
+	if !ok {
+		meta = &TopicMetadata{}
+		topicByUUID[uuid] = meta
+	}
+	meta.UUID = uuid
+	topicMap[name] = meta
+	topicByID[uuid] = name
+	return true
+}
+
+func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]string, topicByUUID map[[16]byte]*TopicMetadata) bool {
+	if start < 0 || start >= len(val) {
+		return false
+	}
+	idx := start
+
+	partitionID, ok := readInt32(val, &idx)
+	if !ok {
+		return false
+	}
+	topicID, ok := readUUID(val, &idx)
+	if !ok {
+		return false
+	}
+	var replicas []int32
+	var isr []int32
+	// KRaft metadata records are flexible; prefer compact arrays.
+	replicas, ok = readCompactInt32Array(val, &idx)
+	if !ok {
+		replicas, ok = readInt32Array(val, &idx)
+		if !ok {
+			return false
+		}
+	}
+	isr, ok = readCompactInt32Array(val, &idx)
+	if !ok {
+		isr, ok = readInt32Array(val, &idx)
+		if !ok {
+			return false
+		}
+	}
+	if _, ok = readCompactInt32Array(val, &idx); !ok { // removingReplicas
+		if _, ok = readInt32Array(val, &idx); !ok {
+			return false
+		}
+	}
+	if _, ok = readCompactInt32Array(val, &idx); !ok { // addingReplicas
+		if _, ok = readInt32Array(val, &idx); !ok {
+			return false
+		}
+	}
+	leader, ok := readInt32(val, &idx)
+	if !ok {
+		return false
+	}
+	leaderEpoch, ok := readInt32(val, &idx)
+	if !ok {
+		return false
+	}
+	if _, ok := readInt32(val, &idx); !ok { // partitionEpoch
+		return false
+	}
+	if _, ok := readCompactUUIDArray(val, &idx); !ok {
+		dirCount, ok2 := readInt32(val, &idx)
+		if !ok2 || dirCount < 0 {
+			return false
+		}
+		for i := int32(0); i < dirCount; i++ {
+			if _, ok := readUUID(val, &idx); !ok {
+				return false
+			}
+		}
+	}
+	_ = skipTaggedFields(val, &idx)
+
+	meta, ok := topicByUUID[topicID]
+	if !ok {
+		meta = &TopicMetadata{UUID: topicID}
+		topicByUUID[topicID] = meta
+	}
+	if name, ok := topicByID[topicID]; ok {
+		topicMap[name] = meta
+	}
+	meta.Partitions = append(meta.Partitions, PartitionMetadata{
+		ID:          partitionID,
+		Leader:      leader,
+		LeaderEpoch: leaderEpoch,
+		Replicas:    replicas,
+		ISR:         isr,
+	})
+	return true
 }
