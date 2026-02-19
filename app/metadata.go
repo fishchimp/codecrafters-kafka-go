@@ -149,7 +149,13 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 	}
 	// Fallback to prefix in value if key didn't provide it.
 	if rtype == -1 {
-		if len(val) >= 2 && (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
+		if len(val) >= 3 && val[0] == 0 && (val[1] == 2 || val[1] == 3) && (val[2] == 0 || val[2] == 1) {
+			// Newer metadata values can include:
+			// frame_version (1 byte), record_type (1 byte), record_version (1 byte).
+			rtype = int(val[1])
+			version = int(val[2])
+			idx = 3
+		} else if len(val) >= 2 && (val[0] == 2 || val[0] == 3) && (val[1] == 0 || val[1] == 1) {
 			rtype = int(val[0])
 			version = int(val[1])
 			idx = 2
