@@ -8,9 +8,13 @@ import (
 	"os"
 )
 
+const clusterMetadataLogPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
+
 func main() {
 	fmt.Println("Logs from your program will appear here!")
-	_ = loadClusterMetadataLog("/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log")
+	if err := loadClusterMetadataLog(clusterMetadataLogPath); err != nil {
+		fmt.Printf("Initial metadata load failed: %v\n", err)
+	}
 
 	l, err := net.Listen("tcp", "0.0.0.0:9092")
 	if err != nil {
@@ -149,6 +153,13 @@ func handleConn(conn net.Conn) {
 
 			// Lookup topic metadata
 			topicMeta, topicFound = topicMap[topicName]
+			if !topicFound {
+				// Retry once in case metadata log wasn't ready during startup.
+				if err := loadClusterMetadataLog(clusterMetadataLogPath); err != nil {
+					fmt.Printf("Metadata reload failed: %v\n", err)
+				}
+				topicMeta, topicFound = topicMap[topicName]
+			}
 		}
 
 		if requestAPIKey == 75 {
