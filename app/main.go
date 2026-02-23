@@ -9,11 +9,14 @@ import (
 	"sort"
 )
 
-const clusterMetadataLogPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
+const fallbackClusterMetadataLogPath = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
+
+var clusterMetadataLogPaths []string
 
 func main() {
 	fmt.Println("Logs from your program will appear here!")
-	if err := loadClusterMetadataLog(clusterMetadataLogPath); err != nil {
+	clusterMetadataLogPaths = discoverClusterMetadataLogPaths(os.Args)
+	if err := loadClusterMetadataLogs(clusterMetadataLogPaths); err != nil {
 		fmt.Printf("Initial metadata load failed: %v\n", err)
 	}
 
@@ -156,14 +159,15 @@ func handleConn(conn net.Conn) {
 			topicMeta, topicFound = topicMap[topicName]
 			if !topicFound {
 				// Retry once in case metadata log wasn't ready during startup.
-				if err := loadClusterMetadataLog(clusterMetadataLogPath); err != nil {
+				clusterMetadataLogPaths = discoverClusterMetadataLogPaths(os.Args)
+				if err := loadClusterMetadataLogs(clusterMetadataLogPaths); err != nil {
 					fmt.Printf("Metadata reload failed: %v\n", err)
 				}
 				topicMeta, topicFound = topicMap[topicName]
 			}
 			if !topicFound {
 				// Last-resort tolerant scan for this topic in metadata log.
-				meta, ok, err := lookupTopicMetadataFromLog(clusterMetadataLogPath, topicName)
+				meta, ok, err := lookupTopicMetadataFromLogs(clusterMetadataLogPaths, topicName)
 				if err != nil {
 					fmt.Printf("Metadata direct lookup failed: %v\n", err)
 				} else if ok && meta != nil {
