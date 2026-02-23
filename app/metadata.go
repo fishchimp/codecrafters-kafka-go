@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 )
 
@@ -354,57 +355,16 @@ func findTopicUUIDInValue(val []byte, topicName string) ([16]byte, bool) {
 }
 
 func findPartitionInValue(val []byte, topicUUID [16]byte) (PartitionMetadata, bool) {
-	// Partition payloads can be framed/prefixed differently. Probe broadly.
 	for start := 0; start+20 <= len(val); start++ {
-		idx := start
-		partitionID, ok := readInt32(val, &idx)
+		p, tid, ok := decodePartitionRecordAt(val, start)
 		if !ok {
 			continue
 		}
-		tid, ok := readUUID(val, &idx)
-		if !ok || tid != topicUUID {
+		if tid != topicUUID {
 			continue
 		}
-		replicas, ok := readCompactInt32Array(val, &idx)
-		if !ok {
-			replicas, ok = readInt32Array(val, &idx)
-			if !ok {
-				continue
-			}
-		}
-		isr, ok := readCompactInt32Array(val, &idx)
-		if !ok {
-			isr, ok = readInt32Array(val, &idx)
-			if !ok {
-				continue
-			}
-		}
-		if _, ok = readCompactInt32Array(val, &idx); !ok {
-			if _, ok = readInt32Array(val, &idx); !ok {
-				continue
-			}
-		}
-		if _, ok = readCompactInt32Array(val, &idx); !ok {
-			if _, ok = readInt32Array(val, &idx); !ok {
-				continue
-			}
-		}
-		leader, ok := readInt32(val, &idx)
-		if !ok {
-			continue
-		}
-		leaderEpoch, ok := readInt32(val, &idx)
-		if !ok {
-			continue
-		}
-		// Ignore optional trailing fields/tagged fields if present.
-		return PartitionMetadata{
-			ID:          partitionID,
-			Leader:      leader,
-			LeaderEpoch: leaderEpoch,
-			Replicas:    replicas,
-			ISR:         isr,
-		}, true
+		fmt.Printf("Fallback partition candidate matched: partition_id=%d\n", p.ID)
+		return p, true
 	}
 	return PartitionMetadata{}, false
 }
@@ -540,66 +500,11 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 	if start < 0 || start >= len(val) {
 		return false
 	}
-	maxProbe := len(val) - 20
-	if maxProbe < start {
-		maxProbe = start
-	}
-	for probe := start; probe <= maxProbe; probe++ {
-		idx := probe
-
-		partitionID, ok := readInt32(val, &idx)
-		if !ok {
+	for probe := start; probe+20 <= len(val); probe++ {
+		p, topicID, ok := decodePartitionRecordAt(val, probe)
+		if !ok || isZeroUUID(topicID) {
 			continue
 		}
-		topicID, ok := readUUID(val, &idx)
-		if !ok {
-			continue
-		}
-		if isZeroUUID(topicID) {
-			continue
-		}
-		var replicas []int32
-		var isr []int32
-		// KRaft metadata records are flexible; prefer compact arrays.
-		replicas, ok = readCompactInt32Array(val, &idx)
-		if !ok {
-			replicas, ok = readInt32Array(val, &idx)
-			if !ok {
-				continue
-			}
-		}
-		isr, ok = readCompactInt32Array(val, &idx)
-		if !ok {
-			isr, ok = readInt32Array(val, &idx)
-			if !ok {
-				continue
-			}
-		}
-		if _, ok = readCompactInt32Array(val, &idx); !ok { // removingReplicas
-			if _, ok = readInt32Array(val, &idx); !ok {
-				continue
-			}
-		}
-		if _, ok = readCompactInt32Array(val, &idx); !ok { // addingReplicas
-			if _, ok = readInt32Array(val, &idx); !ok {
-				continue
-			}
-		}
-		leader, ok := readInt32(val, &idx)
-		if !ok {
-			continue
-		}
-		leaderEpoch, ok := readInt32(val, &idx)
-		if !ok {
-			continue
-		}
-
-		// Trailing tagged fields (flexible versions) are optional for our metadata usage.
-		if idx < len(val) {
-			next := idx
-			_ = skipTaggedFields(val, &next)
-		}
-
 		meta, ok := topicByUUID[topicID]
 		if !ok {
 			meta = &TopicMetadata{UUID: topicID}
@@ -608,16 +513,91 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 		if name, ok := topicByID[topicID]; ok {
 			topicMap[name] = meta
 		}
-		meta.Partitions = append(meta.Partitions, PartitionMetadata{
-			ID:          partitionID,
-			Leader:      leader,
-			LeaderEpoch: leaderEpoch,
-			Replicas:    replicas,
-			ISR:         isr,
-		})
+		meta.Partitions = append(meta.Partitions, p)
 		return true
 	}
 	return false
+}
+
+func readInt32ArrayFlexible(data []byte, idx *int) ([]int32, bool) {
+	arr, ok := readCompactInt32Array(data, idx)
+	if ok {
+		return arr, true
+	}
+	return readInt32Array(data, idx)
+}
+
+func skipInt32ArrayFlexible(data []byte, idx *int) bool {
+	if _, ok := readCompactInt32Array(data, idx); ok {
+		return true
+	}
+	if _, ok := readInt32Array(data, idx); ok {
+		return true
+	}
+	return false
+}
+
+func decodePartitionRecordAt(val []byte, start int) (PartitionMetadata, [16]byte, bool) {
+	var zero [16]byte
+	if start < 0 || start+20 > len(val) {
+		return PartitionMetadata{}, zero, false
+	}
+	idx := start
+
+	partitionID, ok := readInt32(val, &idx)
+	if !ok {
+		return PartitionMetadata{}, zero, false
+	}
+	topicID, ok := readUUID(val, &idx)
+	if !ok || isZeroUUID(topicID) {
+		return PartitionMetadata{}, zero, false
+	}
+	replicas, ok := readInt32ArrayFlexible(val, &idx)
+	if !ok {
+		return PartitionMetadata{}, zero, false
+	}
+	isr, ok := readInt32ArrayFlexible(val, &idx)
+	if !ok {
+		return PartitionMetadata{}, zero, false
+	}
+	if !skipInt32ArrayFlexible(val, &idx) { // removingReplicas
+		return PartitionMetadata{}, zero, false
+	}
+	if !skipInt32ArrayFlexible(val, &idx) { // addingReplicas
+		return PartitionMetadata{}, zero, false
+	}
+	leader, ok := readInt32(val, &idx)
+	if !ok {
+		return PartitionMetadata{}, zero, false
+	}
+
+	// Alternative A: older layouts where leaderEpoch follows leader directly.
+	if idxA := idx; idxA+4 <= len(val) {
+		if leaderEpoch, ok := readInt32(val, &idxA); ok {
+			return PartitionMetadata{
+				ID:          partitionID,
+				Leader:      leader,
+				LeaderEpoch: leaderEpoch,
+				Replicas:    replicas,
+				ISR:         isr,
+			}, topicID, true
+		}
+	}
+
+	// Alternative B: newer layouts with leaderRecoveryState (int8) before leaderEpoch.
+	if idx+1+4 <= len(val) {
+		idxB := idx + 1
+		if leaderEpoch, ok := readInt32(val, &idxB); ok {
+			return PartitionMetadata{
+				ID:          partitionID,
+				Leader:      leader,
+				LeaderEpoch: leaderEpoch,
+				Replicas:    replicas,
+				ISR:         isr,
+			}, topicID, true
+		}
+	}
+	return PartitionMetadata{}, zero, false
 }
 
 func isZeroUUID(u [16]byte) bool {
