@@ -1,77 +1,93 @@
 [![progress-banner](https://backend.codecrafters.io/progress/kafka/60f8d06b-5176-483d-9af7-40d6c8f9dd6a)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
 
-This is a starting point for Go solutions to the
-["Build Your Own Kafka" Challenge](https://codecrafters.io/challenges/kafka).
+This is a Go solution for the
+["Build Your Own Kafka" challenge](https://codecrafters.io/challenges/kafka).
 
-In this challenge, you'll build a toy Kafka clone that's capable of accepting
-and responding to ApiVersions & Fetch API requests. You'll also learn about
-encoding and decoding messages using the Kafka wire protocol. You'll also learn
-about handling the network protocol, event loops, TCP sockets and more.
+## Quick Start
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
-
-# Passing the first stage
-
-The entry point for your Kafka implementation is in `app/main.go`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+1. Ensure `go (1.25)` is installed.
+2. Run locally:
 
 ```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+./your_program.sh /tmp/server.properties
 ```
 
-That's all!
+3. Submit to CodeCrafters:
 
-# Stage 2 & beyond
+```sh
+codecrafters submit
+```
 
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `go (1.25)` installed locally
-1. Run `./your_program.sh` to run your Kafka broker, which is implemented in
-   `app/main.go`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
-
-# Implementation Status (as of 21 Feb 2026)
-
-## Complete Capabilities
+## Implementation Status (as of 2026-02-23)
 
 ### Basic
 1. Bind to a port
-1. Send Correlation ID
-1. Parse Correlation ID
-1. Parse API Version
-1. Handle ApiVersions requests
+2. Send correlation ID
+3. Parse correlation ID
+4. Parse API version
+5. Handle ApiVersions requests
 
 ### Concurrent Clients
 1. Serial requests
-1. Concurrent requests
+2. Concurrent requests
 
-### Listing Partitions
-1. Include DescribeTopicPartitions in ApiVersions
-1. List for an unknown topic
-1. List for a single partition
+### Listing Partitions Stage Matrix
 
-## Incomplete
+| Stage | Status |
+| --- | --- |
+| Include DescribeTopicPartitions in ApiVersions | Done |
+| List for an unknown topic | Done |
+| List for a single partition | Done |
+| List for multiple partitions (KU4) | In progress (regressed) |
+| List for multiple topics (WQ2) | In progress |
 
-### Listing Partitions
-1. List for multiple partitions
-1. List for multiple topics
+### Current Known Issue
 
-### Consuming Messages
-1. Include Fetch in ApiVersions
-1. Fetch with no topics
-1. Fetch with an unknown topic
-1. Fetch with an empty topic
-1. Fetch single message from disk
-1. Fetch multiple messages from disk
+Current failing pattern for KU4/WQ2:
+1. Topic-level metadata resolves (`error_code=0`, `topic_id` is correct).
+2. `partitions` arrays are empty.
+3. Result: tester fails partition length checks for topic entries.
 
-### Producing Messages
-1. Include Produce in ApiVersions
-1. Respond for invalid topic or partition
-1. Respond for valid topic and partition
-1. Produce a single record
-1. Produce multiple records
-1. Produce to multiple partitions
-1. Produce to multiple partitions of multiple topics
+## What Works Today
+
+1. `ApiVersions` request handling (including correlation ID + supported APIs).
+2. `DescribeTopicPartitions` request parsing for compact `topics` array, `response_partition_limit`, and `cursor`.
+3. Alphabetical ordering of response topics for multi-topic responses.
+4. Metadata source discovery from `/tmp/server.properties` via `log.dirs` and scan of `__cluster_metadata-0` segment files.
+
+## How to Run and Debug
+
+### Run locally
+
+```sh
+./your_program.sh /tmp/server.properties
+```
+
+### Submit remotely
+
+```sh
+codecrafters submit
+```
+
+### Where logs appear
+
+Runtime logs are printed to stdout by the broker process (visible in local terminal and in tester output during submit).
+
+### Partition Debug Checklist
+
+1. Confirm request topics are parsed correctly.
+2. Confirm topic UUID resolves and is non-zero.
+3. Confirm partition IDs are discovered before response encoding.
+4. Confirm fallback metadata path (`lookupTopicMetadataFromLogs`) is exercised when needed.
+5. Confirm response `partitions` compact array length is greater than `1` when partitions exist.
+
+## Repository Map
+
+1. `app/main.go`: TCP server, request parsing, response encoding.
+2. `app/metadata.go`: metadata log parsing, topic/partition extraction, fallback logic.
+3. `app/config.go`: `server.properties` parsing and metadata segment discovery.
+4. `app/encoding.go`: primitive protocol/metadata decoders and append helpers.
+
+## Architecture Notes
+
+See `docs/ARCHITECTURE.md` for design decisions, metadata pipeline details, and known limitations.
