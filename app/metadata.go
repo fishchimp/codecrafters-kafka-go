@@ -287,10 +287,12 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 				if err != nil {
 					break
 				}
+				var key []byte
 				if keyLen >= 0 {
 					if off+keyLen > recordEnd {
 						break
 					}
+					key = data[off : off+keyLen]
 					off += keyLen
 				}
 				valLen, err := readVarintZigZag(data, &off)
@@ -300,7 +302,20 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 				if valLen >= 0 && off+valLen <= recordEnd {
 					val := data[off : off+valLen]
 					if p, ok := findPartitionInValue(val, topicUUID); ok {
-						partitions = append(partitions, p)
+						if !hasPartitionID(partitions, p.ID) {
+							partitions = append(partitions, p)
+						}
+					} else if keyTopicID, partitionID, ok := decodePartitionIDFromKey(key); ok && keyTopicID == topicUUID {
+						if !hasPartitionID(partitions, partitionID) {
+							fmt.Printf("Key fallback partition matched: topic=%s partition_id=%d\n", topicName, partitionID)
+							partitions = append(partitions, PartitionMetadata{
+								ID:          partitionID,
+								Leader:      1,
+								LeaderEpoch: 0,
+								Replicas:    []int32{1},
+								ISR:         []int32{1},
+							})
+						}
 					}
 					off += valLen
 				}
@@ -457,6 +472,18 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 				return
 			}
 		}
+		if topicID, partitionID, ok := decodePartitionIDFromKey(key); ok {
+			meta, found := topicByUUID[topicID]
+			if !found {
+				meta = &TopicMetadata{UUID: topicID}
+				topicByUUID[topicID] = meta
+			}
+			addPartitionDefault(meta, partitionID)
+			if name, ok := topicByID[topicID]; ok {
+				topicMap[name] = meta
+				fmt.Printf("Key fallback partition added: topic=%s partition_id=%d\n", name, partitionID)
+			}
+		}
 	}
 }
 
@@ -513,10 +540,34 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 		if name, ok := topicByID[topicID]; ok {
 			topicMap[name] = meta
 		}
-		meta.Partitions = append(meta.Partitions, p)
+		if !hasPartitionID(meta.Partitions, p.ID) {
+			meta.Partitions = append(meta.Partitions, p)
+		}
 		return true
 	}
 	return false
+}
+
+func hasPartitionID(parts []PartitionMetadata, id int32) bool {
+	for _, p := range parts {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func addPartitionDefault(meta *TopicMetadata, partitionID int32) {
+	if meta == nil || hasPartitionID(meta.Partitions, partitionID) {
+		return
+	}
+	meta.Partitions = append(meta.Partitions, PartitionMetadata{
+		ID:          partitionID,
+		Leader:      1,
+		LeaderEpoch: 0,
+		Replicas:    []int32{1},
+		ISR:         []int32{1},
+	})
 }
 
 func readInt32ArrayFlexible(data []byte, idx *int) ([]int32, bool) {
@@ -598,6 +649,43 @@ func decodePartitionRecordAt(val []byte, start int) (PartitionMetadata, [16]byte
 		}
 	}
 	return PartitionMetadata{}, zero, false
+}
+
+func decodePartitionIDFromKey(key []byte) ([16]byte, int32, bool) {
+	var zero [16]byte
+	if len(key) < 20 {
+		return zero, 0, false
+	}
+
+	candidates := []int{}
+	if len(key) >= 3 && key[0] == 0 && key[1] == 3 {
+		candidates = append(candidates, 3)
+	} else if len(key) >= 4 && int(binary.BigEndian.Uint16(key[0:2])) == 3 {
+		candidates = append(candidates, 4)
+	} else if len(key) >= 2 && int(binary.BigEndian.Uint16(key[0:2])) == 3 {
+		candidates = append(candidates, 2)
+	} else if len(key) >= 1 && key[0] == 3 {
+		candidates = append(candidates, 1)
+	} else {
+		candidates = []int{0, 1, 2, 3, 4}
+	}
+
+	for _, start := range candidates {
+		if start+20 > len(key) {
+			continue
+		}
+		idx := start
+		partitionID, ok := readInt32(key, &idx)
+		if !ok {
+			continue
+		}
+		topicID, ok := readUUID(key, &idx)
+		if !ok || isZeroUUID(topicID) {
+			continue
+		}
+		return topicID, partitionID, true
+	}
+	return zero, 0, false
 }
 
 func isZeroUUID(u [16]byte) bool {
