@@ -354,7 +354,8 @@ func findTopicUUIDInValue(val []byte, topicName string) ([16]byte, bool) {
 }
 
 func findPartitionInValue(val []byte, topicUUID [16]byte) (PartitionMetadata, bool) {
-	for start := 0; start < len(val) && start < 10; start++ {
+	// Partition payloads can be framed/prefixed differently. Probe broadly.
+	for start := 0; start+20 <= len(val); start++ {
 		idx := start
 		partitionID, ok := readInt32(val, &idx)
 		if !ok {
@@ -396,6 +397,7 @@ func findPartitionInValue(val []byte, topicUUID [16]byte) (PartitionMetadata, bo
 		if !ok {
 			continue
 		}
+		// Ignore optional trailing fields/tagged fields if present.
 		return PartitionMetadata{
 			ID:          partitionID,
 			Leader:      leader,
@@ -538,71 +540,84 @@ func tryParsePartitionRecord(val []byte, start int, topicByID map[[16]byte]strin
 	if start < 0 || start >= len(val) {
 		return false
 	}
-	idx := start
+	maxProbe := len(val) - 20
+	if maxProbe < start {
+		maxProbe = start
+	}
+	for probe := start; probe <= maxProbe; probe++ {
+		idx := probe
 
-	partitionID, ok := readInt32(val, &idx)
-	if !ok {
-		return false
-	}
-	topicID, ok := readUUID(val, &idx)
-	if !ok {
-		return false
-	}
-	if isZeroUUID(topicID) {
-		return false
-	}
-	var replicas []int32
-	var isr []int32
-	// KRaft metadata records are flexible; prefer compact arrays.
-	replicas, ok = readCompactInt32Array(val, &idx)
-	if !ok {
-		replicas, ok = readInt32Array(val, &idx)
+		partitionID, ok := readInt32(val, &idx)
 		if !ok {
-			return false
+			continue
 		}
-	}
-	isr, ok = readCompactInt32Array(val, &idx)
-	if !ok {
-		isr, ok = readInt32Array(val, &idx)
+		topicID, ok := readUUID(val, &idx)
 		if !ok {
-			return false
+			continue
 		}
-	}
-	if _, ok = readCompactInt32Array(val, &idx); !ok { // removingReplicas
-		if _, ok = readInt32Array(val, &idx); !ok {
-			return false
+		if isZeroUUID(topicID) {
+			continue
 		}
-	}
-	if _, ok = readCompactInt32Array(val, &idx); !ok { // addingReplicas
-		if _, ok = readInt32Array(val, &idx); !ok {
-			return false
+		var replicas []int32
+		var isr []int32
+		// KRaft metadata records are flexible; prefer compact arrays.
+		replicas, ok = readCompactInt32Array(val, &idx)
+		if !ok {
+			replicas, ok = readInt32Array(val, &idx)
+			if !ok {
+				continue
+			}
 		}
-	}
-	leader, ok := readInt32(val, &idx)
-	if !ok {
-		return false
-	}
-	leaderEpoch, ok := readInt32(val, &idx)
-	if !ok {
-		return false
-	}
+		isr, ok = readCompactInt32Array(val, &idx)
+		if !ok {
+			isr, ok = readInt32Array(val, &idx)
+			if !ok {
+				continue
+			}
+		}
+		if _, ok = readCompactInt32Array(val, &idx); !ok { // removingReplicas
+			if _, ok = readInt32Array(val, &idx); !ok {
+				continue
+			}
+		}
+		if _, ok = readCompactInt32Array(val, &idx); !ok { // addingReplicas
+			if _, ok = readInt32Array(val, &idx); !ok {
+				continue
+			}
+		}
+		leader, ok := readInt32(val, &idx)
+		if !ok {
+			continue
+		}
+		leaderEpoch, ok := readInt32(val, &idx)
+		if !ok {
+			continue
+		}
 
-	meta, ok := topicByUUID[topicID]
-	if !ok {
-		meta = &TopicMetadata{UUID: topicID}
-		topicByUUID[topicID] = meta
+		// Trailing tagged fields (flexible versions) are optional for our metadata usage.
+		if idx < len(val) {
+			next := idx
+			_ = skipTaggedFields(val, &next)
+		}
+
+		meta, ok := topicByUUID[topicID]
+		if !ok {
+			meta = &TopicMetadata{UUID: topicID}
+			topicByUUID[topicID] = meta
+		}
+		if name, ok := topicByID[topicID]; ok {
+			topicMap[name] = meta
+		}
+		meta.Partitions = append(meta.Partitions, PartitionMetadata{
+			ID:          partitionID,
+			Leader:      leader,
+			LeaderEpoch: leaderEpoch,
+			Replicas:    replicas,
+			ISR:         isr,
+		})
+		return true
 	}
-	if name, ok := topicByID[topicID]; ok {
-		topicMap[name] = meta
-	}
-	meta.Partitions = append(meta.Partitions, PartitionMetadata{
-		ID:          partitionID,
-		Leader:      leader,
-		LeaderEpoch: leaderEpoch,
-		Replicas:    replicas,
-		ISR:         isr,
-	})
-	return true
+	return false
 }
 
 func isZeroUUID(u [16]byte) bool {
