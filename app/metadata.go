@@ -6,6 +6,9 @@ import (
 )
 
 func loadClusterMetadataLogs(paths []string) error {
+	// Rebuild metadata map on each reload to avoid serving stale partial entries.
+	topicMap = make(map[string]*TopicMetadata)
+
 	// Map from topic UUID -> name (for partition records seen before topic records).
 	topicByID := make(map[[16]byte]string)
 	topicByUUID := make(map[[16]byte]*TopicMetadata)
@@ -121,14 +124,14 @@ func parseClusterMetadataBytes(data []byte, topicByID map[[16]byte]string, topic
 	}
 }
 
-// lookupTopicMetadataFromLog is a tolerant fallback for DescribeTopicPartitions:
+// lookupTopicMetadataFromLogs is a tolerant fallback for DescribeTopicPartitions:
 // it scans record values directly for a matching topic name + UUID and then
 // locates partition records by topic UUID.
 func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetadata, bool, error) {
 	var topicUUID [16]byte
 	foundTopic := false
-	partitions := make([]PartitionMetadata, 0)
 
+	// Pass 1: find topic UUID.
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -220,15 +223,9 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 				}
 
 				if len(val) > 0 {
-					if !foundTopic {
-						if uuid, ok := findTopicUUIDInValue(val, topicName); ok {
-							topicUUID = uuid
-							foundTopic = true
-						}
-					} else {
-						if p, ok := findPartitionInValue(val, topicUUID); ok {
-							partitions = append(partitions, p)
-						}
+					if uuid, ok := findTopicUUIDInValue(val, topicName); ok {
+						topicUUID = uuid
+						foundTopic = true
 					}
 				}
 
@@ -241,91 +238,94 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 	if !foundTopic {
 		return nil, false, nil
 	}
-	if len(partitions) == 0 {
-		// Do one more pass for partitions in case topic record appeared late.
-		for _, path := range paths {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return nil, false, err
+
+	// Pass 2: collect all partitions for the discovered topic UUID.
+	partitions := make([]PartitionMetadata, 0)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, false, err
+		}
+		for off := 0; off+12 <= len(data); {
+			batchLen := int(binary.BigEndian.Uint32(data[off+8 : off+12]))
+			if batchLen <= 0 || off+12+batchLen > len(data) {
+				break
 			}
-			for off := 0; off+12 <= len(data); {
-				batchLen := int(binary.BigEndian.Uint32(data[off+8 : off+12]))
-				if batchLen <= 0 || off+12+batchLen > len(data) {
-					break
-				}
-				batchEnd := off + 12 + batchLen
-				off += 12
-				if off+49 > len(data) {
-					break
-				}
-				if data[off+4] != 2 {
-					off = batchEnd
-					continue
-				}
-				recordsCount := binary.BigEndian.Uint32(data[off+45 : off+49])
-				off += 49
-				for i := uint32(0); i < recordsCount && off < batchEnd; i++ {
-					recordLenU, err := readUvarint(data, &off)
-					if err != nil {
-						break
-					}
-					recordLen := int(recordLenU)
-					if recordLen <= 0 {
-						break
-					}
-					recordEnd := off + recordLen
-					if recordEnd > batchEnd {
-						break
-					}
-					off++ // attributes
-					if _, err := readVarintZigZag(data, &off); err != nil {
-						break
-					}
-					if _, err := readVarintZigZag(data, &off); err != nil {
-						break
-					}
-					keyLen, err := readVarintZigZag(data, &off)
-					if err != nil {
-						break
-					}
-					if keyLen >= 0 {
-						off += keyLen
-					}
-					valLen, err := readVarintZigZag(data, &off)
-					if err != nil {
-						break
-					}
-					if valLen >= 0 && off+valLen <= recordEnd {
-						val := data[off : off+valLen]
-						if p, ok := findPartitionInValue(val, topicUUID); ok {
-							partitions = append(partitions, p)
-						}
-						off += valLen
-					}
-					hCount, err := readVarintZigZag(data, &off)
-					if err != nil {
-						break
-					}
-					for h := 0; h < hCount; h++ {
-						hKeyLen, err := readVarintZigZag(data, &off)
-						if err != nil {
-							break
-						}
-						if hKeyLen > 0 {
-							off += hKeyLen
-						}
-						hValLen, err := readVarintZigZag(data, &off)
-						if err != nil {
-							break
-						}
-						if hValLen > 0 {
-							off += hValLen
-						}
-					}
-					off = recordEnd
-				}
+			batchEnd := off + 12 + batchLen
+			off += 12
+			if off+49 > len(data) {
+				break
+			}
+			if data[off+4] != 2 {
 				off = batchEnd
+				continue
 			}
+			recordsCount := binary.BigEndian.Uint32(data[off+45 : off+49])
+			off += 49
+			for i := uint32(0); i < recordsCount && off < batchEnd; i++ {
+				recordLenU, err := readUvarint(data, &off)
+				if err != nil {
+					break
+				}
+				recordLen := int(recordLenU)
+				if recordLen <= 0 {
+					break
+				}
+				recordEnd := off + recordLen
+				if recordEnd > batchEnd {
+					break
+				}
+				off++ // attributes
+				if _, err := readVarintZigZag(data, &off); err != nil {
+					break
+				}
+				if _, err := readVarintZigZag(data, &off); err != nil {
+					break
+				}
+				keyLen, err := readVarintZigZag(data, &off)
+				if err != nil {
+					break
+				}
+				if keyLen >= 0 {
+					if off+keyLen > recordEnd {
+						break
+					}
+					off += keyLen
+				}
+				valLen, err := readVarintZigZag(data, &off)
+				if err != nil {
+					break
+				}
+				if valLen >= 0 && off+valLen <= recordEnd {
+					val := data[off : off+valLen]
+					if p, ok := findPartitionInValue(val, topicUUID); ok {
+						partitions = append(partitions, p)
+					}
+					off += valLen
+				}
+				hCount, err := readVarintZigZag(data, &off)
+				if err != nil {
+					break
+				}
+				for h := 0; h < hCount; h++ {
+					hKeyLen, err := readVarintZigZag(data, &off)
+					if err != nil {
+						break
+					}
+					if hKeyLen > 0 {
+						off += hKeyLen
+					}
+					hValLen, err := readVarintZigZag(data, &off)
+					if err != nil {
+						break
+					}
+					if hValLen > 0 {
+						off += hValLen
+					}
+				}
+				off = recordEnd
+			}
+			off = batchEnd
 		}
 	}
 

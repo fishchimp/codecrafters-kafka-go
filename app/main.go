@@ -157,7 +157,8 @@ func handleConn(conn net.Conn) {
 
 			// Lookup topic metadata
 			topicMeta, topicFound = topicMap[topicName]
-			if !topicFound {
+			needsRefresh := !topicFound || topicMeta == nil || len(topicMeta.Partitions) == 0
+			if needsRefresh {
 				// Retry once in case metadata log wasn't ready during startup.
 				clusterMetadataLogPaths = discoverClusterMetadataLogPaths(os.Args)
 				if err := loadClusterMetadataLogs(clusterMetadataLogPaths); err != nil {
@@ -165,7 +166,8 @@ func handleConn(conn net.Conn) {
 				}
 				topicMeta, topicFound = topicMap[topicName]
 			}
-			if !topicFound {
+			needsFallback := !topicFound || topicMeta == nil || len(topicMeta.Partitions) == 0
+			if needsFallback {
 				// Last-resort tolerant scan for this topic in metadata log.
 				meta, ok, err := lookupTopicMetadataFromLogs(clusterMetadataLogPaths, topicName)
 				if err != nil {
@@ -174,6 +176,9 @@ func handleConn(conn net.Conn) {
 					topicMap[topicName] = meta
 					topicMeta, topicFound = meta, true
 				}
+			}
+			if topicFound && topicMeta != nil {
+				fmt.Printf("Loaded topic metadata: %s partitions=%d\n", topicName, len(topicMeta.Partitions))
 			}
 		}
 
@@ -201,6 +206,7 @@ func handleConn(conn net.Conn) {
 				sort.Slice(partitionIDs, func(i, j int) bool {
 					return partitionIDs[i] < partitionIDs[j]
 				})
+				fmt.Printf("DescribeTopicPartitions %s partition_ids=%v\n", topicName, partitionIDs)
 
 				partitionsArray = make([]byte, 0)
 				partitionsArray = append(partitionsArray, byte(len(partitionIDs)+1)) // compact array len
