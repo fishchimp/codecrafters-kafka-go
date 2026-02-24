@@ -299,25 +299,29 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 				if err != nil {
 					break
 				}
-				if valLen >= 0 && off+valLen <= recordEnd {
+				if valLen >= 0 {
+					if off+valLen > recordEnd {
+						break
+					}
 					val := data[off : off+valLen]
 					if p, ok := findPartitionInValue(val, topicUUID); ok {
 						if !hasPartitionID(partitions, p.ID) {
 							partitions = append(partitions, p)
 						}
-					} else if partitionID, ok := extractPartitionIDForTopicFromKey(key, topicUUID); ok {
-						if !hasPartitionID(partitions, partitionID) {
-							fmt.Printf("Key fallback partition matched: topic=%s partition_id=%d\n", topicName, partitionID)
-							partitions = append(partitions, PartitionMetadata{
-								ID:          partitionID,
-								Leader:      1,
-								LeaderEpoch: 0,
-								Replicas:    []int32{1},
-								ISR:         []int32{1},
-							})
-						}
 					}
 					off += valLen
+				}
+				if partitionID, ok := extractPartitionIDForTopicFromKey(key, topicUUID); ok {
+					if !hasPartitionID(partitions, partitionID) {
+						fmt.Printf("Key fallback partition matched: topic=%s partition_id=%d\n", topicName, partitionID)
+						partitions = append(partitions, PartitionMetadata{
+							ID:          partitionID,
+							Leader:      1,
+							LeaderEpoch: 0,
+							Replicas:    []int32{1},
+							ISR:         []int32{1},
+						})
+					}
 				}
 				hCount, err := readVarintZigZag(data, &off)
 				if err != nil {
@@ -343,6 +347,9 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 			}
 			off = batchEnd
 		}
+	}
+	if len(partitions) == 0 {
+		fmt.Printf("No partitions found after fallbacks: topic=%s topic_uuid=%x\n", topicName, topicUUID)
 	}
 
 	meta := &TopicMetadata{
@@ -667,6 +674,11 @@ func decodePartitionIDFromKey(key []byte) ([16]byte, int32, bool) {
 			return topicID, partitionID, true
 		}
 	}
+
+	if topicID, partitionID, ok := scanPartitionKeyByUUIDAnchor(key); ok {
+		fmt.Printf("Key fallback source=key-anchor topic_uuid=%x partition_id=%d\n", topicID, partitionID)
+		return topicID, partitionID, true
+	}
 	return zero, 0, false
 }
 
@@ -682,6 +694,11 @@ func extractPartitionIDForTopicFromKey(key []byte, topicUUID [16]byte) (int32, b
 		if topicID, partitionID, ok := decodePartitionKeyAt(key, start); ok && topicID == topicUUID {
 			return partitionID, true
 		}
+	}
+
+	if partitionID, ok := scanPartitionIDForTopicByUUIDAnchor(key, topicUUID); ok {
+		fmt.Printf("Key fallback source=key-anchor topic_uuid=%x partition_id=%d\n", topicUUID, partitionID)
+		return partitionID, true
 	}
 	return 0, false
 }
@@ -726,6 +743,67 @@ func decodePartitionKeyAt(key []byte, start int) ([16]byte, int32, bool) {
 		}
 	}
 	return zero, 0, false
+}
+
+func scanPartitionIDForTopicByUUIDAnchor(key []byte, topicUUID [16]byte) (int32, bool) {
+	if len(key) < 20 || isZeroUUID(topicUUID) {
+		return 0, false
+	}
+
+	for i := 0; i+16 <= len(key); i++ {
+		var u [16]byte
+		copy(u[:], key[i:i+16])
+		if u != topicUUID {
+			continue
+		}
+
+		if i >= 4 {
+			idx := i - 4
+			if pid, ok := readInt32(key, &idx); ok && isSanePartitionID(pid) {
+				return pid, true
+			}
+		}
+		if i+16+4 <= len(key) {
+			idx := i + 16
+			if pid, ok := readInt32(key, &idx); ok && isSanePartitionID(pid) {
+				return pid, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func scanPartitionKeyByUUIDAnchor(key []byte) ([16]byte, int32, bool) {
+	var zero [16]byte
+	if len(key) < 20 {
+		return zero, 0, false
+	}
+
+	for i := 0; i+16 <= len(key); i++ {
+		var topicID [16]byte
+		copy(topicID[:], key[i:i+16])
+		if isZeroUUID(topicID) {
+			continue
+		}
+
+		if i >= 4 {
+			idx := i - 4
+			if pid, ok := readInt32(key, &idx); ok && isSanePartitionID(pid) {
+				return topicID, pid, true
+			}
+		}
+		if i+16+4 <= len(key) {
+			idx := i + 16
+			if pid, ok := readInt32(key, &idx); ok && isSanePartitionID(pid) {
+				return topicID, pid, true
+			}
+		}
+	}
+	return zero, 0, false
+}
+
+func isSanePartitionID(id int32) bool {
+	return id >= 0 && id < 1000000
 }
 
 func isZeroUUID(u [16]byte) bool {
