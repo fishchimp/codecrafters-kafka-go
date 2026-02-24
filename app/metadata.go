@@ -305,7 +305,7 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 						if !hasPartitionID(partitions, p.ID) {
 							partitions = append(partitions, p)
 						}
-					} else if keyTopicID, partitionID, ok := decodePartitionIDFromKey(key); ok && keyTopicID == topicUUID {
+					} else if partitionID, ok := extractPartitionIDForTopicFromKey(key, topicUUID); ok {
 						if !hasPartitionID(partitions, partitionID) {
 							fmt.Printf("Key fallback partition matched: topic=%s partition_id=%d\n", topicName, partitionID)
 							partitions = append(partitions, PartitionMetadata{
@@ -657,33 +657,73 @@ func decodePartitionIDFromKey(key []byte) ([16]byte, int32, bool) {
 		return zero, 0, false
 	}
 
-	candidates := []int{}
-	if len(key) >= 3 && key[0] == 0 && key[1] == 3 {
-		candidates = append(candidates, 3)
-	} else if len(key) >= 4 && int(binary.BigEndian.Uint16(key[0:2])) == 3 {
-		candidates = append(candidates, 4)
-	} else if len(key) >= 2 && int(binary.BigEndian.Uint16(key[0:2])) == 3 {
-		candidates = append(candidates, 2)
-	} else if len(key) >= 1 && key[0] == 3 {
-		candidates = append(candidates, 1)
-	} else {
-		candidates = []int{0, 1, 2, 3, 4}
-	}
+	candidates := partitionKeyCandidateStarts(key)
 
 	for _, start := range candidates {
 		if start+20 > len(key) {
 			continue
 		}
-		idx := start
-		partitionID, ok := readInt32(key, &idx)
-		if !ok {
+		if topicID, partitionID, ok := decodePartitionKeyAt(key, start); ok {
+			return topicID, partitionID, true
+		}
+	}
+	return zero, 0, false
+}
+
+func extractPartitionIDForTopicFromKey(key []byte, topicUUID [16]byte) (int32, bool) {
+	if len(key) < 20 || isZeroUUID(topicUUID) {
+		return 0, false
+	}
+
+	for _, start := range partitionKeyCandidateStarts(key) {
+		if start+20 > len(key) {
 			continue
 		}
-		topicID, ok := readUUID(key, &idx)
-		if !ok || isZeroUUID(topicID) {
-			continue
+		if topicID, partitionID, ok := decodePartitionKeyAt(key, start); ok && topicID == topicUUID {
+			return partitionID, true
 		}
-		return topicID, partitionID, true
+	}
+	return 0, false
+}
+
+func partitionKeyCandidateStarts(key []byte) []int {
+	if len(key) >= 3 && key[0] == 0 && key[1] == 3 {
+		return []int{3, 0, 1, 2, 4}
+	}
+	if len(key) >= 4 && int(binary.BigEndian.Uint16(key[0:2])) == 3 {
+		return []int{4, 0, 1, 2, 3}
+	}
+	if len(key) >= 2 && int(binary.BigEndian.Uint16(key[0:2])) == 3 {
+		return []int{2, 0, 1, 3, 4}
+	}
+	if len(key) >= 1 && key[0] == 3 {
+		return []int{1, 0, 2, 3, 4}
+	}
+	return []int{0, 1, 2, 3, 4}
+}
+
+func decodePartitionKeyAt(key []byte, start int) ([16]byte, int32, bool) {
+	var zero [16]byte
+	if start < 0 || start+20 > len(key) {
+		return zero, 0, false
+	}
+
+	// Layout A: partition_id(int32), topic_id(uuid)
+	idx := start
+	partitionID, ok := readInt32(key, &idx)
+	if ok {
+		if topicID, ok := readUUID(key, &idx); ok && !isZeroUUID(topicID) {
+			return topicID, partitionID, true
+		}
+	}
+
+	// Layout B: topic_id(uuid), partition_id(int32)
+	idx = start
+	topicID, ok := readUUID(key, &idx)
+	if ok && !isZeroUUID(topicID) {
+		if partitionID, ok := readInt32(key, &idx); ok {
+			return topicID, partitionID, true
+		}
 	}
 	return zero, 0, false
 }
