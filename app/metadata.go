@@ -308,6 +308,17 @@ func lookupTopicMetadataFromLogs(paths []string, topicName string) (*TopicMetada
 						if !hasPartitionID(partitions, p.ID) {
 							partitions = append(partitions, p)
 						}
+					} else if partitionID, ok := extractPartitionForTopicFromValueByUUIDAnchor(val, topicUUID); ok {
+						if !hasPartitionID(partitions, partitionID) {
+							fmt.Printf("Value fallback source=value-anchor topic=%s topic_uuid=%x partition_id=%d\n", topicName, topicUUID, partitionID)
+							partitions = append(partitions, PartitionMetadata{
+								ID:          partitionID,
+								Leader:      1,
+								LeaderEpoch: 0,
+								Replicas:    []int32{1},
+								ISR:         []int32{1},
+							})
+						}
 					}
 					off += valLen
 				}
@@ -479,6 +490,19 @@ func parseMetadataRecord(key []byte, val []byte, topicByID map[[16]byte]string, 
 				return
 			}
 		}
+		if topicID, partitionID, ok := scanPartitionValueByUUIDAnchor(val); ok {
+			meta, found := topicByUUID[topicID]
+			if !found {
+				meta = &TopicMetadata{UUID: topicID}
+				topicByUUID[topicID] = meta
+			}
+			addPartitionDefault(meta, partitionID)
+			if name, ok := topicByID[topicID]; ok {
+				topicMap[name] = meta
+			}
+			fmt.Printf("Value fallback source=value-anchor topic_uuid=%x partition_id=%d\n", topicID, partitionID)
+			return
+		}
 		if topicID, partitionID, ok := decodePartitionIDFromKey(key); ok {
 			meta, found := topicByUUID[topicID]
 			if !found {
@@ -578,21 +602,56 @@ func addPartitionDefault(meta *TopicMetadata, partitionID int32) {
 }
 
 func readInt32ArrayFlexible(data []byte, idx *int) ([]int32, bool) {
+	start := *idx
 	arr, ok := readCompactInt32Array(data, idx)
 	if ok {
 		return arr, true
 	}
-	return readInt32Array(data, idx)
+	*idx = start
+	return readNullableInt32Array(data, idx)
 }
 
 func skipInt32ArrayFlexible(data []byte, idx *int) bool {
+	start := *idx
 	if _, ok := readCompactInt32Array(data, idx); ok {
 		return true
 	}
-	if _, ok := readInt32Array(data, idx); ok {
+	*idx = start
+	if skipNullableInt32Array(data, idx) {
 		return true
 	}
 	return false
+}
+
+func readNullableInt32Array(data []byte, idx *int) ([]int32, bool) {
+	start := *idx
+	n, ok := readInt32(data, idx)
+	if !ok {
+		*idx = start
+		return nil, false
+	}
+	if n == -1 {
+		return []int32{}, true
+	}
+	if n < -1 {
+		*idx = start
+		return nil, false
+	}
+	arr := make([]int32, n)
+	for i := int32(0); i < n; i++ {
+		v, ok := readInt32(data, idx)
+		if !ok {
+			*idx = start
+			return nil, false
+		}
+		arr[i] = v
+	}
+	return arr, true
+}
+
+func skipNullableInt32Array(data []byte, idx *int) bool {
+	_, ok := readNullableInt32Array(data, idx)
+	return ok
 }
 
 func decodePartitionRecordAt(val []byte, start int) (PartitionMetadata, [16]byte, bool) {
@@ -623,6 +682,9 @@ func decodePartitionRecordAt(val []byte, start int) (PartitionMetadata, [16]byte
 	}
 	if !skipInt32ArrayFlexible(val, &idx) { // addingReplicas
 		return PartitionMetadata{}, zero, false
+	}
+	if len(replicas) == 0 || len(isr) == 0 {
+		fmt.Printf("Partition decode accepted nullable arrays: topic_uuid=%x partition_id=%d\n", topicID, partitionID)
 	}
 	leader, ok := readInt32(val, &idx)
 	if !ok {
@@ -771,6 +833,63 @@ func scanPartitionIDForTopicByUUIDAnchor(key []byte, topicUUID [16]byte) (int32,
 		}
 	}
 	return 0, false
+}
+
+func extractPartitionForTopicFromValueByUUIDAnchor(val []byte, topicUUID [16]byte) (int32, bool) {
+	if len(val) < 20 || isZeroUUID(topicUUID) {
+		return 0, false
+	}
+
+	for i := 0; i+16 <= len(val); i++ {
+		var u [16]byte
+		copy(u[:], val[i:i+16])
+		if u != topicUUID {
+			continue
+		}
+
+		if i >= 4 {
+			idx := i - 4
+			if pid, ok := readInt32(val, &idx); ok && isSanePartitionID(pid) {
+				return pid, true
+			}
+		}
+		if i+16+4 <= len(val) {
+			idx := i + 16
+			if pid, ok := readInt32(val, &idx); ok && isSanePartitionID(pid) {
+				return pid, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func scanPartitionValueByUUIDAnchor(val []byte) ([16]byte, int32, bool) {
+	var zero [16]byte
+	if len(val) < 20 {
+		return zero, 0, false
+	}
+
+	for i := 0; i+16 <= len(val); i++ {
+		var topicID [16]byte
+		copy(topicID[:], val[i:i+16])
+		if isZeroUUID(topicID) {
+			continue
+		}
+
+		if i >= 4 {
+			idx := i - 4
+			if pid, ok := readInt32(val, &idx); ok && isSanePartitionID(pid) {
+				return topicID, pid, true
+			}
+		}
+		if i+16+4 <= len(val) {
+			idx := i + 16
+			if pid, ok := readInt32(val, &idx); ok && isSanePartitionID(pid) {
+				return topicID, pid, true
+			}
+		}
+	}
+	return zero, 0, false
 }
 
 func scanPartitionKeyByUUIDAnchor(key []byte) ([16]byte, int32, bool) {
